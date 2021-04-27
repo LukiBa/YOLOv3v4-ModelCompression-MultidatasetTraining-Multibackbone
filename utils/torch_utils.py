@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import torch.backends.cudnn as cudnn
 from utils.quantized.quantized_google import *
+from utils.quantized.quantized_intuitus import *
 
 
 def init_seeds(seed=0):
@@ -97,21 +98,36 @@ def fuse_conv_and_bn(conv, bn, quantized=-1, FPGA=False):
                                                  bias=True)
             fusedconv.weight_quantizer = deepcopy(conv.weight_quantizer)
             fusedconv.activation_quantizer = deepcopy(conv.activation_quantizer)
+        elif quantized == 5 and isinstance(conv,IntuitusConv2d):
+            fusedconv = IntuitusConv2d(conv.in_channels,
+                                        conv.out_channels,
+                                        groups=conv.groups,
+                                        kernel_size=conv.kernel_size,
+                                        stride=conv.stride,
+                                        padding=conv.padding,
+                                        bias=True)
+            fusedconv.weight_quantizer = deepcopy(conv.weight_quantizer)
+            fusedconv.activation_quantizer = deepcopy(conv.activation_quantizer)            
         else:
-            print("BN fuse error!")
+            #print("BN fuse error!")
             return
         # prepare filters
-        w_conv = conv.weight.clone().view(conv.out_channels, -1)
-        w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
-        fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.size()))
+        w_conv = conv.weight.clone() #.view(conv.out_channels, -1)
+        w_bn = bn.weight/(torch.sqrt(bn.eps + bn.running_var))
+        #w_bn = bn.weight
+        fusedconv.weight.copy_(w_conv*w_bn.view(-1,1,1,1)) #torch.mm(w_bn, w_conv).view(fusedconv.weight.size()))
 
         # prepare spatial bias
         if conv.bias is not None:
             b_conv = conv.bias
         else:
             b_conv = torch.zeros(conv.weight.size(0))
-        b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-        fusedconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+        b_bn = bn.bias + (bn.weight*(b_conv-bn.running_mean))/(torch.sqrt(bn.running_var + bn.eps))
+        #b_bn = bn.bias
+        fusedconv.bias.copy_(b_bn) #torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+        
+        if quantized == 5 and isinstance(conv,IntuitusConv2d):
+            fusedconv.normalize_weights_and_bias() # start training from quantized weights and bias
 
         return fusedconv
 

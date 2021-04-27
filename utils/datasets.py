@@ -14,7 +14,9 @@ from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from torch.autograd import Function
-from utils.utils import xyxy2xywh, xywh2xyxy
+from utils.utils import xyxy2xywh, xywh2xyxy, draw_bbox_nms
+
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
 help_url = 'https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data'
 img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.dng']
@@ -528,6 +530,168 @@ def load_image(self, index, is_gray_scale=False):
     else:
         return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
 
+
+class LoadImagesAndLabels2(Dataset):  # for training/testing
+    def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, image_weights=False,
+                 cache_images=False, single_cls=False):
+        path = Path(path).absolute()  # os-agnostic
+        assert os.path.isfile(path), 'File not found %s. See %s' % (path, help_url)
+
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        
+        nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
+
+        with open(path, 'r') as annotation_file:
+            self.img_files = []
+            self.labels = []
+
+            # Cache labels
+            pbar = tqdm(annotation_file, desc='Caching labels')
+            for num, line in enumerate(pbar):
+                annotation = line.strip().split()
+                self.img_files.append(str(Path(annotation[0]).absolute()))
+                bbox_data_gt = np.array([list(map(int, box.split(','))) for box in annotation[1:]])
+                if bbox_data_gt.shape[0]:
+                    self.labels.append(np.concatenate([bbox_data_gt[:,-1:],bbox_data_gt[:,:-1]],axis=-1)) # change position from class to 0            
+                    nf += 1  # file found
+                else:
+                    ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
+        
+        n = len(self.img_files)
+        assert n > 0, 'No images found in %s. See %s' % (path, help_url)
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+
+        self.n = n
+        self.batch = bi  # batch index of image
+              
+        self.imgs = [None] * n
+
+        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
+        if cache_images:  # if training
+            gb = 0  # Gigabytes of cached images
+            pbar = tqdm(range(len(self.img_files)), desc='Caching images')
+            self.img_hw0, self.img_hw = [None] * n, [None] * n
+            for i in pbar:  # max 10k images
+                self.imgs[i], self.img_hw0[i], self.img_hw[i] = load_image(self, i)  # img, hw_original, hw_resized
+                gb += self.imgs[i].nbytes
+                pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
+
+    def __len__(self):
+        return len(self.img_files)
+
+    # def __iter__(self):
+    #     self.count = -1
+    #     print('ran dataset iter')
+    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
+    #     return self
+
+    def __getitem__(self, index):
+        if self.image_weights:
+            index = self.indices[index]
+
+        hyp = self.hyp
+        # Load image
+        img, (h0, w0), (h, w) = load_image(self, index)
+
+        # Letterbox
+        #shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+        shape = self.img_size
+        img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+        shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
+        # Load labels
+        labels = []
+        x = self.labels[index]
+        if x.size > 0:
+            # Normalized xywh to pixel xyxy format
+            labels = x.copy()
+            labels[:, 1] = ratio[0] * w/w0 * x[:, 1] + pad[0]  # pad width
+            labels[:, 2] = ratio[1] * h/h0 * x[:, 2] + pad[1]  # pad height
+            labels[:, 3] = ratio[0] * w/w0 * x[:, 3] + pad[0]
+            labels[:, 4] = ratio[1] * h/h0 * x[:, 4] + pad[1]
+
+#        test1 = np.copy(labels)
+        if self.augment:
+            # Augment imagespace
+            img, labels = random_affine(img, labels,
+                                        degrees=hyp['degrees'],
+                                        translate=hyp['translate'],
+                                        scale=hyp['scale'],
+                                        shear=hyp['shear'])
+
+            # Augment colorspace
+            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            # Apply cutouts
+            # if random.random() < 0.9:
+            #     labels = cutout(img, labels)
+
+        nL = len(labels)  # number of labels
+        if nL:
+            # convert xyxy to xywh
+            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])
+
+            # Normalize coordinates 0 - 1
+            labels = labels.astype(np.float32)
+            labels[:, [2, 4]] = labels[:, [2, 4]] / img.shape[0]  # height
+            labels[:, [1, 3]] = np.float32(labels[:, [1, 3]] / img.shape[1])  # width
+            
+#        test2 = np.copy(xywh2xyxy(labels[:,1:])) * 416
+#        test = [xywh2xyxy(labels[:,1:]),np.ones((labels.shape[0],1)),labels[:,0]]
+#        image = draw_bbox_nms(img, test,'C:/Users/lukas/Documents/Datasets/coco/coco.names')
+
+        if self.augment:
+            # random left-right flip
+            lr_flip = True
+            if lr_flip and random.random() < 0.5:
+                img = np.fliplr(img)
+                if nL:
+                    labels[:, 1] = 1 - labels[:, 1]
+
+            # random up-down flip
+            ud_flip = False
+            if ud_flip and random.random() < 0.5:
+                img = np.flipud(img)
+                if nL:
+                    labels[:, 2] = 1 - labels[:, 2]
+
+        labels_out = torch.zeros((nL, 6))
+        if nL:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+
+        # Convert
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img)
+
+        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+
+    @staticmethod
+    def collate_fn(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+
+
+    def load_image(self, index):
+        # loads 1 image from dataset, returns img, original hw, resized hw
+        img = self.imgs[index]
+        if img is None:  # not cached
+            path = self.img_files[index]
+            img = cv2.imread(path)  # BGR
+            assert img is not None, 'Image Not Found ' + path
+            h0, w0 = img.shape[:2]  # orig hw
+            r = self.img_size / max(h0, w0)  # resize image to img_size
+            if r < 1 or (self.augment and r != 1):  # always resize down, only resize up if training with augmentation
+                interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
+                img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
+        else:
+            return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
