@@ -1,4 +1,5 @@
 classes=80
-train=data/coco2017/train2017.txt
-valid=data/coco2017/val2017.txt
-names=data/coco.names
+train=C:/Users/lukas/Documents/Datasets/coco/train2017.txt
+valid=C:/Users/lukas/Documents/Datasets/coco/val2017.txt
+names=C:/Users/lukas/Documents/Datasets/coco/coco.names
+instances=C:/Users/lukas/Documents/Datasets/coco/annotations/instances_val2017.json

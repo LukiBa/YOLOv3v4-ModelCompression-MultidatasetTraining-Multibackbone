@@ -1,11 +1,38 @@
 import argparse
 import json
-
+from pathlib import Path
+import shutil
 from torch.utils.data import DataLoader
 from models import *
 from utils.datasets import *
 from utils.utils import *
 
+
+def _create_parser():
+    parser = argparse.ArgumentParser(prog='test.py')
+    parser.add_argument('--model', type=str, default=None, help='model path') #'pt_models/dorefa.pt'
+    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-quant.cfg', help='*.cfg path')
+    parser.add_argument('--data', type=str, default='data/coco2017_val_split.data', help='*.data path')
+    parser.add_argument('--weights', type=str, default='weights/last_v3_ql4.pt', help='weights path')
+    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
+    parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
+    parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
+    parser.add_argument('--img_outpath', type=str, default='./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
+    parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
+    parser.add_argument('--task', default='test', help="'test', 'study', 'benchmark'")
+    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
+    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
+    parser.add_argument('--quantized', type=int, default=5,
+                        help='0:quantization way one Ternarized weight and 8bit activation')
+    parser.add_argument('--a-bit', type=int, default=8,
+                        help='a-bit')
+    parser.add_argument('--w-bit', type=int, default=8,
+                        help='w-bit')
+    parser.add_argument('--FPGA', action='store_true', help='FPGA')
+    parser.add_argument('--load_model', type=str, default=None, help='weights saved as model')
+    return parser.parse_args()    
 
 def test(cfg,
          data,
@@ -14,7 +41,7 @@ def test(cfg,
          imgsz=416,
          conf_thres=0.001,
          iou_thres=0.6,  # for nms
-         save_json=False,
+         save_json=True,
          single_cls=False,
          augment=False,
          model=None,
@@ -27,6 +54,8 @@ def test(cfg,
          rank=None,
          plot=True,
          is_gray_scale=False):
+         img_outpath=None,
+         load_model=None):
     # Initialize/load model and set device
     if model is None:
         device = torch_utils.select_device(opt.device, batch_size=batch_size)
@@ -41,15 +70,38 @@ def test(cfg,
                         FPGA=FPGA, is_gray_scale=opt.gray_scale)
 
         # Load weights
-        attempt_download(weights)
+        #attempt_download(weights)
         if weights.endswith('.pt'):  # pytorch format
-            model.load_state_dict(torch.load(weights, map_location=device)['model'])
+            if opt.load_model != None:
+                model =  torch.load(load_model)
+            else:
+                chkpt = torch.load(weights, map_location=device)
+                if True:
+                    weight_dict = {}
+                    for name in chkpt['model'].keys():
+                        if '.0.0.' in name:
+                            new_name = name.replace('.0.0.','.0.Conv2d.')
+                            
+                        elif '.0.' in name and not 'Conv2d' in name and not 'BatchNorm2d' in name:
+                            new_name = name.replace('.0.','.Conv2d.')
+                        else:
+                            new_name = name  
+                        weight_dict[new_name] = chkpt['model'][name]
+                else:
+                    weight_dict = chkpt['model']
+                    
+                chkpt['model'] = {k: v for k, v in weight_dict.items() if model.state_dict()[k].numel() == v.numel()}
+                model.load_state_dict(weight_dict, strict=False)                
+            #layer = [module for module in model.modules() if isinstance(module, nn.Conv2d)]
+            #layer[3].fold_bn = True
+            
         else:  # darknet format
             load_darknet_weights(model, weights, FPGA=FPGA)
 
         # Fuse
         model.fuse(quantized=quantized, FPGA=opt.FPGA)
-        model.to(device)
+        print(model)
+        model.to('cuda:0')
 
         if device.type != 'cpu' and torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -65,15 +117,26 @@ def test(cfg,
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
     niou = iouv.numel()
-
+    
+    if img_outpath != None:
+        img_outpath = Path(img_outpath).absolute()
+        img_predpath = img_outpath / 'pred'
+        img_gndpath = img_outpath / 'gnd'
+        if img_predpath.exists():
+            shutil.rmtree(img_predpath, ignore_errors=False, onerror=None)
+        if img_gndpath.exists():
+            shutil.rmtree(img_gndpath, ignore_errors=False, onerror=None)    
+        img_predpath.mkdir(parents=True, exist_ok=True)
+        img_gndpath.mkdir(parents=True, exist_ok=True)
+        
     # Dataloader
     if dataloader is None:
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=single_cls,
-                                      is_gray_scale=is_gray_scale)
+        dataset = LoadImagesAndLabels2(path, imgsz, batch_size, single_cls=single_cls)
+        test = dataset[0]
         batch_size = min(batch_size, len(dataset))
         dataloader = DataLoader(dataset,
                                 batch_size=batch_size,
-                                num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
+                                num_workers=1,
                                 pin_memory=True,
                                 collate_fn=dataset.collate_fn)
 
@@ -83,7 +146,8 @@ def test(cfg,
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
     p, r, f1, mp, mr, map, mf1, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    pbar = tqdm(dataloader, desc=s) if rank in [-1, 0] else dataloader
+    #pbar = tqdm(dataloader, desc=s) if rank in [-1, 0] else dataloader
+    pbar = tqdm(dataloader, desc=s)
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
     for batch_i, (imgs, targets, paths, shapes) in enumerate(pbar):
@@ -150,7 +214,9 @@ def test(cfg,
 
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5]) * whwh
-
+                #tbox = xywh2xyxy(labels[:, 1:5])
+                #tbox = labels[:, 1:5]
+                
                 # Per target class
                 for cls in torch.unique(tcls_tensor):
                     ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
@@ -174,12 +240,11 @@ def test(cfg,
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
         # Plot images
-        if batch_i < 1 and plot:
+        if img_outpath != None:#if batch_i < 1:
             f = 'test_batch%g_gt.jpg' % batch_i  # filename
-            plot_images(imgs, targets, paths=paths, names=names, fname=f, is_gray_scale=is_gray_scale)  # ground truth
+            plot_images(imgs, targets, paths=paths, names=names, fname=str(img_gndpath/f))  # ground truth
             f = 'test_batch%g_pred.jpg' % batch_i
-            plot_images(imgs, output_to_target(output, width, height), paths=paths, names=names, fname=f,
-                        is_gray_scale=is_gray_scale)  # predictions
+            plot_images(imgs, output_to_target(output, width, height), paths=paths, names=names, fname=str(img_predpath/f))  # predictions
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
@@ -222,7 +287,8 @@ def test(cfg,
             # cocovision = opt.data.split('\\')[-1].split('.')[0]
             # print(cocovision)
             # cocoGt = COCO(glob.glob('data/'+cocovision+'/instances_val*.json')[0])  # initialize COCO ground truth api
-            cocoGt = COCO(glob.glob('data/coco2014/instances_val*.json')[0])  # initialize COCO ground truth api
+            coco_instances_path = str(Path(data['instances']).absolute())
+            cocoGt = COCO(glob.glob(coco_instances_path)[0])  # initialize COCO ground truth api
             cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
 
             cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
@@ -243,38 +309,21 @@ def test(cfg,
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
-    parser.add_argument('--data', type=str, default='data/coco2014.data', help='*.data path')
-    parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralytics.pt', help='weights path')
-    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
-    parser.add_argument('--img-size', type=int, default=512, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
-    parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
-    parser.add_argument('--task', default='test', help="'test', 'study', 'benchmark'")
-    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
-    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
-    parser.add_argument('--augment', action='store_true', help='augmented inference')
-    parser.add_argument('--quantized', type=int, default=-1,
-                        help='0:quantization way one Ternarized weight and 8bit activation')
-    parser.add_argument('--a-bit', type=int, default=8,
-                        help='a-bit')
-    parser.add_argument('--w-bit', type=int, default=8,
-                        help='w-bit')
-    parser.add_argument('--FPGA', action='store_true', help='FPGA')
-    parser.add_argument('--gray_scale', action='store_true', help='gray scale trainning')
-
-    opt = parser.parse_args()
+   
+    opt = _create_parser()     
     opt.save_json = opt.save_json or any([x in opt.data for x in ['coco.data', 'coco2014.data', 'coco2017.data']])
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
+    model = None
+    #opt.FPGA = True
+    if opt.model != None:
+        model = torch.load(opt.model)
 
     print(opt)
 
     # task = 'test', 'study', 'benchmark'
     if opt.task == 'test':  # (default) test normally
-        test(opt.cfg,
+        results, maps = test(opt.cfg,
              opt.data,
              opt.weights,
              opt.batch_size,
@@ -284,12 +333,17 @@ if __name__ == '__main__':
              opt.save_json,
              opt.single_cls,
              opt.augment,
+             model = model,
              quantized=opt.quantized,
              a_bit=opt.a_bit,
              w_bit=opt.w_bit,
              FPGA=opt.FPGA,
-             rank=-1,
-             is_gray_scale=opt.gray_scale)
+             img_outpath = opt.img_outpath,
+             load_model = opt.load_model)
+        
+        s = ('P','R','mAP@0.5','F1')
+        print('%10s' * 4 % s + '\n')
+        print('%10.3g' * 4 % results[:4] + '\n')
 
     elif opt.task == 'benchmark':  # mAPs at 256-640 at conf 0.5 and 0.7
         y = []

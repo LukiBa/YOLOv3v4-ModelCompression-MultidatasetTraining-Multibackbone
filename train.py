@@ -1,10 +1,10 @@
 import argparse
 
+import torch.distributed as dist
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.tensorboard import SummaryWriter
 
-import test  # import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
@@ -16,19 +16,29 @@ from utils.torch_utils import ModelEMA, select_device  # DDP import
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# import local test.py
+import pathlib
+import importlib.util
+TEST_MODULE_PATH = pathlib.Path(__file__).absolute().parent / 'test.py'
+spec = importlib.util.spec_from_file_location(TEST_MODULE_PATH.stem,TEST_MODULE_PATH)
+test_py = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(test_py)
+
+from datetime import datetime
+
 wdir = 'weights' + os.sep  # weights dir
 last = wdir + 'last.pt'
 best = wdir + 'best.pt'
 results_file = 'results.txt'
 
 # Hyperparameters
-hyp = {'giou': 3.54,  # giou loss gain
+hyp = {'giou': 1.0,#3.54,  # giou loss gain
        'cls': 37.4,  # cls loss gain
        'cls_pw': 1.0,  # cls BCELoss positive_weight
        'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
        'iou_t': 0.20,  # iou training threshold
-       'lr0': 0.01,  # initial learning rate (SGD=5E-3, Adam=5E-4)
+       'lr0': 5e-2,  # initial learning rate (SGD=5E-3, Adam=5E-4)
        'lrf': 0.0005,  # final learning rate (with cos scheduler)
        'momentum': 0.937,  # SGD momentum
        'weight_decay': 0.0005,  # optimizer weight decay
@@ -40,6 +50,54 @@ hyp = {'giou': 3.54,  # giou loss gain
        'translate': 0.05 * 0,  # image translation (+/- fraction)
        'scale': 0.05 * 0,  # image scale (+/- gain)
        'shear': 0.641 * 0}  # image shear (+/- deg)
+
+def _create_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=68)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
+    parser.add_argument('--batch-size', type=int, default=4)  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-quant.cfg', help='*.cfg path')
+    parser.add_argument('--t_cfg', type=str, default=None)#'./cfg/yolov3tiny/yolov3-tiny-fused.cfg')#'./cfg/yolov3tiny/yolov3-tiny-quant.cfg')#'./cfg/yolov4tiny/yolov3-tiny.cfg', help='teacher model cfg file path for knowledge distillation')
+    parser.add_argument('--weights', type=str, default='weights/last_v3_ql4.pt', help='initial weights path')
+    parser.add_argument('--t_weights', type=str, default='weights/last.pt', help='teacher model weights')    
+    parser.add_argument('--data', type=str, default='data/coco2017_val_split.data', help='*.data path')
+    parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
+    parser.add_argument('--img-size', nargs='+', type=int, default=[416, 416], help='[min_train, max-train, test]')
+    parser.add_argument('--rect', action='store_true', help='rectangular training')
+    parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
+    parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
+    parser.add_argument('--notest', action='store_true', help='only test final epoch')
+    parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
+    parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
+    parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
+    parser.add_argument('--KDstr', type=int, default=5, help='Knowledge destillation strategy see https://github.com/SpursLipu/YOLOv3v4-ModelCompression-MultidatasetTraining-Multibackbone/#readme')
+    parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
+    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
+    parser.add_argument('--adam', action='store_true', help='use adam optimizer')
+    parser.add_argument('--ema', action='store_true', help='use ema')
+    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
+    parser.add_argument('--pretrain', '-pt', dest='pt', action='store_true',
+                        help='use pretrain model')
+    parser.add_argument('--mixedprecision', '-mpt', dest='mpt', action='store_true',
+                        help='use mixed precision training')
+    parser.add_argument('--s', type=float, default=0.001, help='scale sparse rate')
+    parser.add_argument('--prune', type=int, default=-1,
+                        help='0:nomal prune or regular prune 1:shortcut prune 2:layer prune')
+    parser.add_argument('--quantized', type=int, default=5,
+                        help='0:quantization way one Ternarized weight and 8bit activation')
+    parser.add_argument('--a-bit', type=int, default=8,
+                        help='a-bit')
+    parser.add_argument('--w-bit', type=int, default=8,
+                        help='w-bit')
+    parser.add_argument('--FPGA', action='store_true', help='FPGA')
+    parser.add_argument('--test_img_outpath', type=str, default='./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
+    parser.add_argument('--load_model', type=str, default=None) #"22-04-2021_10-25-04.pt", help='weights saved as model')
+    parser.add_argument('--load_teacher_model', type=str, default=None) #"22-04-2021_00-13-22.pt", help='weights saved as model')
+
+    # DDP get local-rank
+    parser.add_argument('--rank', default=0, help='rank of current process')
+    parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+
+    return parser.parse_args()    
 
 # Overwrite hyp with hyp*.txt (optional)
 f = glob.glob('hyp*.txt')
@@ -53,7 +111,7 @@ if hyp['fl_gamma']:
     print('Using FocalLoss(gamma=%g)' % hyp['fl_gamma'])
 
 
-def train(hyp):
+def train(hyp,opt):
     cfg = opt.cfg
     t_cfg = opt.t_cfg  # teacher model cfg for knowledge distillation
     data = opt.data
@@ -91,26 +149,29 @@ def train(hyp):
         os.remove(f)
 
     # DDP  init
-    if opt.local_rank != -1:
-        if opt.local_rank == 0:
-            print("--------------using ddp---------------")
-        assert torch.cuda.device_count() > opt.local_rank
-        torch.cuda.set_device(opt.local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
+    # if opt.local_rank != -1:
+    #     if opt.local_rank == 0:
+    #         print("--------------using ddp---------------")
+    #     assert torch.cuda.device_count() > opt.local_rank
+    #     torch.cuda.set_device(opt.local_rank)
+    #     dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
 
-        assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
-        opt.batch_size = opt.batch_size // opt.world_size
-    else:
-        dist.init_process_group(backend='nccl',  # 'distributed backend'
-                                init_method='tcp://127.0.0.1:9999',  # distributed training init method
-                                world_size=1,  # number of nodes for distributed training
-                                rank=0)  # distributed training node rank
+    #     assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
+    #     opt.batch_size = opt.batch_size // opt.world_size
+    # else:
+    #     dist.init_process_group(backend='nccl',  # 'distributed backend'
+    #                             init_method="file:///d:/tmp/some_file",  # distributed training init method
+    #                             world_size=1,  # number of nodes for distributed training
+    #                             rank=0)  # distributed training node rank
 
     # Initialize model
     steps = math.ceil(len(open(train_path).readlines()) / batch_size) * epochs
     model = Darknet(cfg, quantized=opt.quantized, a_bit=opt.a_bit, w_bit=opt.w_bit,
-                    FPGA=opt.FPGA, steps=steps, is_gray_scale=opt.gray_scale).to(device)
-    if t_cfg:
+                    FPGA=opt.FPGA, steps=steps).to(device)
+    
+    if opt.load_teacher_model:
+        t_model =  torch.load(opt.load_teacher_model)
+    elif t_cfg:
         t_model = Darknet(t_cfg).to(device)
 
     # print('<.....................using gridmask.......................>')
@@ -121,7 +182,7 @@ def train(hyp):
     for k, v in dict(model.named_parameters()).items():
         if '.bias' in k:
             pg2 += [v]  # biases
-        elif 'Conv2d.weight' in k:
+        elif '.weight' in k and not 'BatchNorm2d' in k :
             pg1 += [v]  # apply weight_decay
         else:
             pg0 += [v]  # all else
@@ -130,10 +191,16 @@ def train(hyp):
         # hyp['lr0'] *= 0.1  # reduce lr (i.e. SGD=5E-3, Adam=5E-4)
         optimizer = optim.Adam(pg0, lr=hyp['lr0'])
         # optimizer = AdaBound(pg0, lr=hyp['lr0'], final_lr=0.1)
+        optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+        optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
     else:
-        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
-    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
-    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+        if pg0 != []:
+            optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+            optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+            optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+        else:
+            optimizer = optim.SGD(pg1, lr=hyp['lr0'], momentum=hyp['momentum'],weight_decay=hyp['weight_decay'], nesterov=True)
+            optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
     print('Optimizer groups: %g .bias, %g Conv2d.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
     del pg0, pg1, pg2
 
@@ -145,33 +212,59 @@ def train(hyp):
             chkpt = torch.load(weights, map_location=device)
 
             # load model
-            try:
-                chkpt['model'] = {k: v for k, v in chkpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
-                model.load_state_dict(chkpt['model'], strict=False)
-            except KeyError as e:
-                s = "%s is not compatible with %s. Specify --weights '' or specify a --cfg compatible with %s. " \
-                    "See https://github.com/ultralytics/yolov3/issues/657" % (opt.weights, opt.cfg, opt.weights)
-                raise KeyError(s) from e
+            if opt.load_model != None:
+                model =  torch.load(opt.load_model)
+                
+            else:           
+                
+                try:
+                    
+                    if True:
+                        weight_dict = {}
+                        for name in chkpt['model'].keys():
+                            if '.0.0.' in name:
+                                new_name = name.replace('.0.0.','.0.Conv2d.')
+                                
+                            elif '.0.' in name and not 'Conv2d' in name and not 'BatchNorm2d' in name:
+                                new_name = name.replace('.0.','.Conv2d.')
+                            else:
+                                new_name = name  
+                            weight_dict[new_name] = chkpt['model'][name]
+                    else:
+                        weight_dict = chkpt['model']
+                    
+                    chkpt['model'] = {k: v for k, v in weight_dict.items() if model.state_dict()[k].numel() == v.numel()}
+                    model.load_state_dict(weight_dict, strict=False)
 
-            # load optimizer
-            if chkpt['optimizer'] is not None:
-                optimizer.load_state_dict(chkpt['optimizer'])
-                if chkpt.get('best_fitness') is not None:
-                    best_fitness = chkpt['best_fitness']
-            # load results
-            if chkpt.get('training_results') is not None:
-                with open(results_file, 'w') as file:
-                    file.write(chkpt['training_results'])  # write results.txt
-            if chkpt.get('epoch') is not None:
-                start_epoch = chkpt['epoch'] + 1
-            del chkpt
+                except KeyError as e:
+                    s = "%s is not compatible with %s. Specify --weights '' or specify a --cfg compatible with %s. " \
+                        "See https://github.com/ultralytics/yolov3/issues/657" % (opt.weights, opt.cfg, opt.weights)
+                    raise KeyError(s) from e
+    
+                # load optimizer
+                if chkpt['optimizer'] is not None:
+                    #optimizer.load_state_dict(chkpt['optimizer'])
+                    if chkpt.get('best_fitness') is not None:
+                        best_fitness = chkpt['best_fitness']
+                # load results
+                if chkpt.get('training_results') is not None:
+                    with open(results_file, 'w') as file:
+                        file.write(chkpt['training_results'])  # write results.txt
+                if chkpt.get('epoch') is not None:
+                    start_epoch = chkpt['epoch'] + 1
+                del chkpt
 
         elif len(weights) > 0:  # darknet format
             # possible weights are '*.weights', 'yolov3-tiny.conv.15',  'darknet53.conv.74' etc.
             load_darknet_weights(model, weights, pt=opt.pt, FPGA=opt.FPGA)
+        model.to('cpu')
+        model.fuse(quantized=opt.quantized, FPGA=opt.FPGA)
+        model.to('cuda:0')
+            
     if t_cfg:
         if t_weights.endswith('.pt'):
-            t_model.load_state_dict(torch.load(t_weights, map_location=device)['model'])
+            if not opt.load_teacher_model:
+                t_model.load_state_dict(torch.load(t_weights, map_location=device)['model'])
         elif t_weights.endswith('.weights'):
             load_darknet_weights(t_model, t_weights)
         else:
@@ -198,30 +291,32 @@ def train(hyp):
     # plt.savefig('LR.png', dpi=300)
 
     # Initialize distributed training
-    if opt.local_rank != -1:
-        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank, find_unused_parameters=True)
-    else:
-        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+    # if opt.local_rank != -1:
+    #     model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank, find_unused_parameters=True)
+    # else:
+    #     model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
 
-    model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
+    # yolo_layers= []
+    # for layer in model.modules():
+    #     if isinstance(layer, YOLOLayer):
+    #         yolo_layers.append(layer)
+    # model.yolo_layers = yolo_layers  # move yolo layer indices to top level
 
     # Dataset
-    dataset = LoadImagesAndLabels(train_path, img_size, batch_size,
+    dataset = LoadImagesAndLabels2(train_path, img_size, batch_size,
                                   augment=True,
                                   hyp=hyp,  # augmentation hyperparameters
-                                  rect=opt.rect,  # rectangular training
+                                  #rect=opt.rect,  # rectangular training
                                   cache_images=opt.cache_images,
-                                  single_cls=opt.single_cls,
-                                  rank=opt.local_rank,
-                                  is_gray_scale=True if opt.gray_scale else False)
+                                  single_cls=opt.single_cls)
 
-    testset = LoadImagesAndLabels(test_path, imgsz_test, batch_size // 4,
+    testset = LoadImagesAndLabels2(test_path, imgsz_test, batch_size,
                                   hyp=hyp,
-                                  rect=True,
+                                  #rect=True,
                                   cache_images=opt.cache_images,
-                                  single_cls=opt.single_cls,
-                                  rank=opt.local_rank,
-                                  is_gray_scale=True if opt.gray_scale else False)
+                                  single_cls=opt.single_cls)
+    
+#    test = dataset[0]
 
     # 获得要剪枝的层
     if hasattr(model, 'module'):
@@ -249,32 +344,42 @@ def train(hyp):
             print('layer sparse training')
             _, _, prune_idx = parse_module_defs4(model.module_defs)
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)  # ddp sampler
-    test_sampler = torch.utils.data.distributed.DistributedSampler(testset)
-
     # Dataloader
     batch_size = min(batch_size, len(dataset))
-    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
+    nw = 1
+    # train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)  # ddp sampler
+    # test_sampler = torch.utils.data.distributed.DistributedSampler(testset)
+    # nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
+    # dataloader = torch.utils.data.DataLoader(dataset,
+    #                                          batch_size=int(batch_size / opt.world_size),
+    #                                          num_workers=nw,
+    #                                          shuffle=False if (opt.local_rank != -1) else not opt.rect,
+    #                                          pin_memory=True,
+    #                                          collate_fn=dataset.collate_fn,
+    #                                          sampler=train_sampler if (opt.local_rank != -1) else None
+    #
+    # testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, imgsz_test, batch_size,
+    #                                                              hyp=hyp,
+    #                                                              rect=True,
+    #                                                              cache_images=opt.cache_images,
+    #                                                              single_cls=opt.single_cls),
+    #                                          batch_size=batch_size,
+    #                                          num_workers=nw,
+    #                                          pin_memory=True,
+    #                                          collate_fn=dataset.collate_fn)                                          )
     dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=int(batch_size / opt.world_size),
-                                             num_workers=nw,
-                                             shuffle=False if (opt.local_rank != -1) else not opt.rect,
-                                             pin_memory=True,
-                                             collate_fn=dataset.collate_fn,
-                                             sampler=train_sampler if (opt.local_rank != -1) else None
-                                             )
+                                            batch_size=batch_size,
+                                            num_workers=1,
+                                            pin_memory=True,
+                                            collate_fn=dataset.collate_fn)    
     # Testloader
-    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, imgsz_test, batch_size // 4,
-                                                                 hyp=hyp,
-                                                                 rect=True,
-                                                                 cache_images=opt.cache_images,
-                                                                 single_cls=opt.single_cls,
-                                                                 rank=opt.local_rank,
-                                                                 is_gray_scale=True if opt.gray_scale else False),
-                                             batch_size=batch_size // 4,
-                                             num_workers=nw,
-                                             pin_memory=True,
-                                             collate_fn=dataset.collate_fn)
+    testloader = torch.utils.data.DataLoader(testset,
+                                            batch_size=batch_size,
+                                            num_workers=1,
+                                            pin_memory=True,
+                                            collate_fn=dataset.collate_fn)  
+                    
+
     if opt.prune != -1:
         for idx in prune_idx:
             if hasattr(model, 'module'):
@@ -291,7 +396,8 @@ def train(hyp):
     # Model EMA
     if opt.ema:
         ema = torch_utils.ModelEMA(model)
-
+        
+    print(model)
     # Start training
     nb = len(dataloader)  # number of batches
     n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
@@ -306,7 +412,9 @@ def train(hyp):
     if opt.mpt:
         cuda = device.type != 'cpu'
         scaler = amp.GradScaler(enabled=cuda)
+        
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        model.to('cuda:0')
         if opt.local_rank != -1:
             dataloader.sampler.set_epoch(epoch)  # DDP set seed
         # gridmask.set_prob(epoch, max_epoch)
@@ -322,10 +430,12 @@ def train(hyp):
             image_weights = labels_to_image_weights(dataset.labels, nc=nc, class_weights=w)
             dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # rand weighted idx
         mloss = torch.zeros(4).to(device)  # mean losses
-        if opt.local_rank == -1 or opt.local_rank == 0:
-            print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
-        pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        # if opt.local_rank == -1 or opt.local_rank == 0:
+        #     print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
+        pbar = tqdm(dataloader, desc=s, total=nb)
+        #pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
+        for i, (imgs, targets, paths, _) in enumerate(pbar):  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
 
@@ -493,10 +603,11 @@ def train(hyp):
 
         final_epoch = epoch + 1 == epochs
         if not opt.notest or final_epoch:  # Calculate mAP
+            model.fuse_norm()
             is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
-            results, maps = test.test(cfg,
+            results, maps = test_py.test(cfg,
                                       data,
-                                      batch_size=batch_size // 4,
+                                      batch_size=batch_size,
                                       imgsz=imgsz_test,
                                       model=ema.ema if opt.ema else model,
                                       save_json=final_epoch and is_coco,
@@ -508,14 +619,15 @@ def train(hyp):
                                       w_bit=opt.w_bit,
                                       FPGA=opt.FPGA,
                                       rank=opt.local_rank,
-                                      plot=False)
-            torch.cuda.empty_cache()
+                                      plot=False,
+                                      img_outpath=opt.test_img_outpath)
+        torch.cuda.empty_cache()
+
         # Write
-        if opt.local_rank in [-1, 0]:
-            with open(results_file, 'a') as f:
-                f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
-            if len(opt.name) and opt.bucket:
-                os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
+        with open(results_file, 'a') as f:
+            f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+        if len(opt.name) and opt.bucket:
+            os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
 
         # Tensorboard
         if tb_writer:
@@ -548,7 +660,7 @@ def train(hyp):
                 model_temp = model.module.state_dict()
             else:
                 model_temp = model.state_dict()
-        if save and dist.get_rank() == 0:  # DDP save model only once
+        if save: # and dist.get_rank() == 0:  # DDP save model only once
             with open(results_file, 'r') as f:  # create checkpoint
                 chkpt = {'epoch': epoch,
                          'best_fitness': best_fitness,
@@ -561,6 +673,11 @@ def train(hyp):
             if (best_fitness == fi) and not final_epoch:
                 torch.save(chkpt, best)
             del chkpt
+            now = datetime.now()
+            dt_string = now.strftime("%d-%m-%Y_%H-%M-%S")
+            save_model_name =  'pt_models/'+dt_string+'.pt'
+            torch.save(model, save_model_name)
+            
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
@@ -578,64 +695,21 @@ def train(hyp):
 
     if not opt.evolve:
         plot_results()  # save as results.png
-    if opt.local_rank in [-1, 0]:
-        print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
+    # if opt.local_rank in [-1, 0]:
+    #     print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
     dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
     torch.cuda.empty_cache()
     return results
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=300)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
-    parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
-    parser.add_argument('--t_cfg', type=str, default='', help='teacher model cfg file path for knowledge distillation')
-    parser.add_argument('--data', type=str, default='data/coco2017.data', help='*.data path')
-    parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
-    parser.add_argument('--img-size', nargs='+', type=int, default=[320, 640], help='[min_train, max-train, test]')
-    parser.add_argument('--rect', action='store_true', help='rectangular training')
-    parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
-    parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
-    parser.add_argument('--notest', action='store_true', help='only test final epoch')
-    parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
-    parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
-    parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
-    parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralytics.pt', help='initial weights path')
-    parser.add_argument('--t_weights', type=str, default='', help='teacher model weights')
-    parser.add_argument('--KDstr', type=int, default=-1, help='KD strategy')
-    parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
-    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
-    parser.add_argument('--adam', action='store_true', help='use adam optimizer')
-    parser.add_argument('--ema', action='store_true', help='use ema')
-    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
-    parser.add_argument('--pretrain', '-pt', dest='pt', action='store_true',
-                        help='use pretrain model')
-    parser.add_argument('--mixedprecision', '-mpt', dest='mpt', action='store_true',
-                        help='use mixed precision training')
-    parser.add_argument('--s', type=float, default=0.001, help='scale sparse rate')
-    parser.add_argument('--prune', type=int, default=-1,
-                        help='0:nomal prune or regular prune 1:shortcut prune 2:layer prune')
-    parser.add_argument('--quantized', type=int, default=0,
-                        help='0:quantization way one Ternarized weight and 8bit activation')
-    parser.add_argument('--a-bit', type=int, default=8,
-                        help='a-bit')
-    parser.add_argument('--w-bit', type=int, default=8,
-                        help='w-bit')
-    parser.add_argument('--FPGA', '-FPGA', dest='FPGA', action='store_true', help='FPGA')
-    parser.add_argument('--gray_scale', action='store_true', help='gray scale trainning')
-    parser.add_argument('--SWIFT', '-SWIFT', dest='SWIFT', action='store_true', help='ues for SWITF pruning')
 
-    # DDP get local-rank
-    parser.add_argument('--rank', default=0, help='rank of current process')
-    parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
-
-    opt = parser.parse_args()
+    opt = _create_parser()
     opt.weights = last if opt.resume else opt.weights
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     # opt.data = list(glob.iglob(' ./**/' + opt.data, recursive=True))[0]  # find file
     if opt.local_rank in [-1, 0]:
-        print(opt)
+        print(opt) 
     opt.img_size.extend([opt.img_size[-1]] * (3 - len(opt.img_size)))  # extend to 3 sizes (min, max, test)
 
     # DDP set variables
@@ -657,8 +731,8 @@ if __name__ == '__main__':
     if not opt.evolve:  # Train normally
         if opt.local_rank in [-1, 0]:
             print('Start Tensorboard with "tensorboard --logdir=runs", view at http://localhost:6006/')
-            tb_writer = SummaryWriter(comment=opt.name)
-        train(hyp)  # train normally
+        tb_writer = SummaryWriter(comment=opt.name)
+        train(hyp,opt)  # train normally
 
     else:  # Evolve hyperparameters (optional)
         opt.notest, opt.nosave = True, True  # only test/save final epoch

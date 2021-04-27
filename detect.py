@@ -17,16 +17,16 @@ def detect(save_img=False):
     os.makedirs(out)  # make new output folder
 
     # Initialize model
-    model = Darknet(opt.cfg, imgsz, quantized=opt.quantized, quantizer_output=opt.quantizer_output, reorder=opt.reorder,
-                    TN=opt.TN, TM=opt.TM, a_bit=opt.a_bit, w_bit=opt.w_bit, FPGA=opt.FPGA, is_gray_scale=opt.gray_scale)
+    model = Darknet(opt.cfg, imgsz, quantized=opt.quantized,quantizer_output=opt.quantizer_output, a_bit=opt.a_bit, w_bit=opt.w_bit,
+                    FPGA=opt.FPGA)
 
     # Load weights
     attempt_download(weights)
     if weights.endswith('.pt'):  # pytorch format
-        model.load_state_dict(torch.load(weights, map_location=device)['model'], strict=False)
+        model.load_state_dict(torch.load(weights, map_location=device)['model'],strict=False)
     else:  # darknet format
         load_darknet_weights(model, weights)
-    #################打印model_list
+#################打印model_list --> Print model_list
     '''AWEIGHT = torch.load(weights, map_location=device)['model']
     for k,v in AWEIGHT.items():
         print(k)'''
@@ -51,7 +51,7 @@ def detect(save_img=False):
     # Run inference
     t0 = time.time()
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
-    # _ = model(img.float()) if device.type != 'cpu' else None  # run once
+    #_ = model(img.float()) if device.type != 'cpu' else None  # run once
     for path, img, im0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
         img = img.float()  # uint8 to fp16/32
@@ -59,6 +59,9 @@ def detect(save_img=False):
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
 
+        # if opt.FPGA:
+        #     scale = torch.tensor([2 ** (-(opt.a_bit - 2))]).to(img.device)
+        #     img = torch.round(img * scale) / scale
         # Inference
         t1 = torch_utils.time_synchronized()
         pred = model(img, augment=opt.augment)[0]

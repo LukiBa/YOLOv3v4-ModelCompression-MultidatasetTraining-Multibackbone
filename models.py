@@ -5,7 +5,9 @@ from utils.quantized.quantized_dorefa import *
 from utils.quantized.quantized_ptq import *
 from utils.quantized.quantized_ptq_cos import *
 from utils.quantized.quantized_pact import *
+from utils.quantized.quantized_intuitus import *
 from utils.layers import *
+from collections import OrderedDict
 import copy
 
 ONNX_EXPORT = False
@@ -33,6 +35,22 @@ def create_modules(module_defs, img_size, cfg, quantized, quantizer_output,reord
             bn = int(mdef['batch_normalize'])
             filters = int(mdef['filters'])
             kernel_size = int(mdef['size'])
+            if 'quant' in mdef.keys():
+                quant = int(mdef['quant'])
+            else:
+                quant = 0
+ 
+            if 'fused' in mdef.keys() and int(mdef['fused']) != 0:
+                fused = True
+            else:
+                fused = False               
+
+            if 'normalize' in mdef.keys() and int(mdef['normalize']) != 0:
+                normalize = True
+            else:
+                normalize = False 
+    
+
             pad = (kernel_size - 1) // 2 if int(mdef['pad']) else 0
             if quantized == 1:
                 if FPGA:
@@ -197,7 +215,7 @@ def create_modules(module_defs, img_size, cfg, quantized, quantizer_output,reord
                     if mdef['activation'] == 'relu':
                         modules.add_module('activation', nn.ReLU())
                     if mdef['activation'] == 'mish':
-                        modules.add_module('activation', Mish())
+                        modules.add_module('activation', Mish())                        
             elif quantized == 5:
                 modules.add_module('Conv2d', BNFold_COSPTQuantizedConv2d_For_FPGA(in_channels=output_filters[-1],
                                                                                   out_channels=filters,
@@ -213,6 +231,54 @@ def create_modules(module_defs, img_size, cfg, quantized, quantizer_output,reord
                                                                                   activate=mdef['activation'],
                                                                                   quantizer_output=quantizer_output,
                                                                                   reorder=reorder,TM=TM,TN=TN))
+            elif quantized == 6:
+                if FPGA:
+                    modules.add_module('Conv2d', BNFold_IntuitusConv2d(in_channels=output_filters[-1],
+                                                                     out_channels=filters,
+                                                                     kernel_size=kernel_size,
+                                                                     stride=int(mdef['stride']),
+                                                                     padding=pad,
+                                                                     groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                                     bias=not bn,
+                                                                     a_bits=a_bit,
+                                                                     w_bits=w_bit,
+                                                                     bn=bn,
+                                                                     activate=mdef['activation'],
+                                                                     steps=steps))
+                else:
+                    if quant != 0:
+                        quantize_weights = True
+                    else:
+                        quantize_weights = False 
+                                        
+                    modules.add_module('Conv2d', IntuitusConv2d(in_channels=output_filters[-1],
+                                                              out_channels=filters,
+                                                              kernel_size=kernel_size,
+                                                              stride=int(mdef['stride']),
+                                                              padding=pad,
+                                                              groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                              bias=not bn,
+                                                              fold_bn = fused,
+                                                              quantize_weights = quantize_weights,
+                                                              normalize_weights = normalize,
+                                                              a_bits=a_bit,
+                                                              w_bits=w_bit))
+                    if bn:
+                        modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.1))
+                        
+
+                    if mdef['activation'] == 'leaky':
+                        modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
+                        # modules.add_module('activation', nn.PReLU(num_parameters=1, init=0.10))
+                        # modules.add_module('activation', Swish())
+                    if mdef['activation'] == 'relu6':
+                        modules.add_module('activation', ReLU6())
+                    if mdef['activation'] == 'h_swish':
+                        modules.add_module('activation', HardSwish())
+                    if mdef['activation'] == 'relu':
+                        modules.add_module('activation', nn.ReLU())
+                    if mdef['activation'] == 'mish':
+                        modules.add_module('activation', Mish())
             else:
                 modules.add_module('Conv2d', nn.Conv2d(in_channels=output_filters[-1],
                                                        out_channels=filters,
@@ -741,22 +807,43 @@ class Darknet(nn.Module):
 
     def fuse(self, quantized=-1, FPGA=False):
         # Fuse Conv2d + BatchNorm2d layers throughout model
-        if quantized != -1 or FPGA == True:
+        if (quantized != -1 and quantized != 5) or FPGA == True:
             return
         print('Fusing layers...')
         fused_list = nn.ModuleList()
+        if quantized != 6:
+            for a in list(self.children())[0]:
+                if isinstance(a, nn.Sequential):
+                    for i, b in enumerate(a):
+                        if isinstance(b, nn.modules.batchnorm.BatchNorm2d):
+                            # fuse this bn layer with the previous conv2d layer
+                            conv = a[i - 1]
+                            fused = torch_utils.fuse_conv_and_bn(conv, b, quantized, FPGA)
+                            a = nn.Sequential(fused, *list(a.children())[i + 1:])
+                            break
+                fused_list.append(a)
+        else:
+            for a in list(self.children())[0]:
+                if isinstance(a, nn.Sequential):
+                    for i, b in enumerate(a):
+                        if isinstance(b, nn.modules.batchnorm.BatchNorm2d):
+                            # fuse this bn layer with the previous conv2d layer
+                            conv = a[i - 1]
+                            if isinstance(conv, IntuitusConv2d) and conv.fold_bn:
+                                fused = torch_utils.fuse_conv_and_bn(conv, b, quantized, FPGA)
+                                a = nn.Sequential(fused, *list(a.children())[i + 1:])
+                            break
+                fused_list.append(a)            
+        self.module_list = fused_list
+        self.info() if not ONNX_EXPORT else None  # yolov3-spp reduced from 225 to 152 layers
+
+    def fuse_norm(self, quantized=-1, FPGA=False):
         for a in list(self.children())[0]:
             if isinstance(a, nn.Sequential):
                 for i, b in enumerate(a):
-                    if isinstance(b, nn.modules.batchnorm.BatchNorm2d):
-                        # fuse this bn layer with the previous conv2d layer
-                        conv = a[i - 1]
-                        fused = torch_utils.fuse_conv_and_bn(conv, b, quantized, FPGA)
-                        a = nn.Sequential(fused, *list(a.children())[i + 1:])
-                        break
-            fused_list.append(a)
-        self.module_list = fused_list
-        self.info() if not ONNX_EXPORT else None  # yolov3-spp reduced from 225 to 152 layers
+                    if isinstance(b, IntuitusConv2d):
+                        b.fuse_norm()
+                        break     
 
     def info(self, verbose=False):
         torch_utils.model_info(self, verbose)
@@ -785,11 +872,17 @@ def load_darknet_weights(self, weights, cutoff=-1, pt=False, FPGA=False):
         weights = np.fromfile(f, dtype=np.float32)  # The rest are weights
 
     ptr = 0
+    quant = 0
     for i, (mdef, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
         if mdef['type'] == 'convolutional':
             conv_layer = module[0]
             if mdef['batch_normalize']:
-                if FPGA:
+                if 'quant' in mdef.keys():
+                    quant = int(mdef['quant'])
+                else:
+                    quant = 0
+                    
+                if FPGA and quant != 0:
                     # Load BN bias, weights, running mean and running variance
                     num_b = conv_layer.beta.numel()
                     # Bias
@@ -808,6 +901,23 @@ def load_darknet_weights(self, weights, cutoff=-1, pt=False, FPGA=False):
                     bn_rv = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(conv_layer.running_var)
                     conv_layer.running_var.data.copy_(bn_rv)
                     ptr += num_b
+                # elif quant == 2:
+                #     num_b = conv_layer.out_channels  # Number of biases
+                #     # Bias
+                #     bn_b = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(torch.Tensor(num_b))
+                #     ptr += num_b
+                #     # Weight
+                #     bn_w = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(torch.Tensor(num_b))
+                #     ptr += num_b
+                #     # Running Mean
+                #     bn_rm = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(torch.Tensor(num_b))
+                #     bn_layer.running_mean.data.copy_(bn_rm)
+                #     ptr += num_b
+                #     # Running Var
+                #     bn_rv = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(torch.Tensor(num_b))
+                #     bn_layer.running_var.data.copy_(bn_rv)
+                #     ptr += num_b                    
+                
                 else:
                     # Load BN bias, weights, running mean and running variance
                     bn_layer = module[1]
@@ -828,6 +938,8 @@ def load_darknet_weights(self, weights, cutoff=-1, pt=False, FPGA=False):
                     bn_rv = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(bn_layer.running_var)
                     bn_layer.running_var.data.copy_(bn_rv)
                     ptr += num_b
+                    #if quant != 0:
+                        #bn_layer.normalize_parameter() # normalize bn parameter to keep the results inside the quantization window
                 # Load conv. weights
                 num_w = conv_layer.weight.numel()
                 conv_w = torch.from_numpy(weights[ptr:ptr + num_w]).view_as(conv_layer.weight)
@@ -852,6 +964,8 @@ def load_darknet_weights(self, weights, cutoff=-1, pt=False, FPGA=False):
                     conv_w = torch.from_numpy(weights[ptr:ptr + num_w]).view_as(conv_layer.weight)
                     conv_layer.weight.data.copy_(conv_w)
                     ptr += num_w
+            if quant != 0:
+                conv_layer.quantize_weights_and_bias() # start training from quantized weights and bias
         elif mdef['type'] == 'depthwise':
             depthwise_layer = module[0]
             if mdef['batch_normalize']:
@@ -913,8 +1027,8 @@ def load_darknet_weights(self, weights, cutoff=-1, pt=False, FPGA=False):
             fc2.weight.data.copy_(fc2_w)
             ptr += num_fc2
 
-    # 确保指针到达权重的最后一个位置
-    assert ptr == len(weights)
+    # 确保指针到达权重的最后一个位置 Ensure that the pointer reaches the last position of the weight
+    #assert ptr == len(weights)
 
 
 def save_weights(self, path='model.weights', cutoff=-1):
