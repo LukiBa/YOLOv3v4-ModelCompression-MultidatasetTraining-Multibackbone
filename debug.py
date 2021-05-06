@@ -12,11 +12,11 @@ import numpy as np
 def _create_parser():
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--model', type=str, default=None, help='model path') #'pt_models/dorefa.pt'
-    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-quant.cfg', help='*.cfg path')
+    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-fused.cfg', help='*.cfg path')
     parser.add_argument('--cfg_gnd', type=str, default='./cfg/yolov3tiny/yolov3-tiny-fused.cfg', help='*.cfg path')
-    parser.add_argument('--data', type=str, default='data/coco2017.data', help='*.data path')
-    parser.add_argument('--weights', type=str, default='weights/last.pt', help='weights path')
-    parser.add_argument('--gnd_weights', type=str, default='weights/last_v3_ql2_0.pt', help='gnd weights path')
+    parser.add_argument('--data', type=str, default='data/coco2017_val_split.data', help='*.data path')
+    parser.add_argument('--weights', type=str, default='weights/retrain_full_set.pt', help='weights path')
+    parser.add_argument('--gnd_weights', type=str, default='weights/normalized_retrain.pt', help='gnd weights path')
     parser.add_argument('--batch-size', type=int, default=1, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')

@@ -1,0 +1,13 @@
+convolutional_0_adjustment;0.00390625
+convolutional_2_adjustment;0.0078125
+convolutional_4_adjustment;0.03125
+convolutional_6_adjustment;0.015625
+convolutional_8_adjustment;0.0078125
+convolutional_10_adjustment;0.0078125
+convolutional_12_adjustment;0.00390625
+convolutional_13_adjustment;0.03125
+convolutional_14_adjustment;0.00390625
+convolutional_15_adjustment;0.0078125
+convolutional_18_adjustment;0.0078125
+convolutional_21_adjustment;0.00390625
+convolutional_22_adjustment;0.00390625

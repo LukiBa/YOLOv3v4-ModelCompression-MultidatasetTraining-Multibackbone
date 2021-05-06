@@ -32,13 +32,13 @@ best = wdir + 'best.pt'
 results_file = 'results.txt'
 
 # Hyperparameters
-hyp = {'giou': 1.0,#3.54,  # giou loss gain
+hyp = {'giou': 1.0,  # giou loss gain
        'cls': 37.4,  # cls loss gain
        'cls_pw': 1.0,  # cls BCELoss positive_weight
        'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
        'iou_t': 0.20,  # iou training threshold
-       'lr0': 5e-2,  # initial learning rate (SGD=5E-3, Adam=5E-4)
+       'lr0': 5E-3,  # initial learning rate (SGD=5E-3, Adam=5E-4)
        'lrf': 0.0005,  # final learning rate (with cos scheduler)
        'momentum': 0.937,  # SGD momentum
        'weight_decay': 0.0005,  # optimizer weight decay
@@ -53,12 +53,12 @@ hyp = {'giou': 1.0,#3.54,  # giou loss gain
 
 def _create_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=68)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
-    parser.add_argument('--batch-size', type=int, default=4)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-quant.cfg', help='*.cfg path')
-    parser.add_argument('--t_cfg', type=str, default=None)#'./cfg/yolov3tiny/yolov3-tiny-fused.cfg')#'./cfg/yolov3tiny/yolov3-tiny-quant.cfg')#'./cfg/yolov4tiny/yolov3-tiny.cfg', help='teacher model cfg file path for knowledge distillation')
-    parser.add_argument('--weights', type=str, default='weights/last_v3_ql4.pt', help='initial weights path')
-    parser.add_argument('--t_weights', type=str, default='weights/last.pt', help='teacher model weights')    
+    parser.add_argument('--epochs', type=int, default=64)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
+    parser.add_argument('--batch-size', type=int, default=1)  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-fused.cfg', help='*.cfg path')
+    parser.add_argument('--t_cfg', type=str, default=None)#'./cfg/yolov3tiny/yolov3-tiny-fused.cfg')#./cfg/yolov3tiny/yolov3-tiny-teacher.cfg')#'./cfg/yolov3tiny/yolov3-tiny-quant.cfg')#'./cfg/yolov4tiny/yolov3-tiny.cfg', help='teacher model cfg file path for knowledge distillation')
+    parser.add_argument('--weights', type=str, default='weights/retrain_full_relu.pt', help='initial weights path')
+    parser.add_argument('--t_weights', type=str, default='weights/last_v3_foldbn_all.pt', help='teacher model weights')    
     parser.add_argument('--data', type=str, default='data/coco2017_val_split.data', help='*.data path')
     parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
     parser.add_argument('--img-size', nargs='+', type=int, default=[416, 416], help='[min_train, max-train, test]')
@@ -89,7 +89,7 @@ def _create_parser():
     parser.add_argument('--w-bit', type=int, default=8,
                         help='w-bit')
     parser.add_argument('--FPGA', action='store_true', help='FPGA')
-    parser.add_argument('--test_img_outpath', type=str, default='./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
+    parser.add_argument('--test_img_outpath', type=str, default=None)#'./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
     parser.add_argument('--load_model', type=str, default=None) #"22-04-2021_10-25-04.pt", help='weights saved as model')
     parser.add_argument('--load_teacher_model', type=str, default=None) #"22-04-2021_00-13-22.pt", help='weights saved as model')
 
@@ -259,6 +259,9 @@ def train(hyp,opt):
             load_darknet_weights(model, weights, pt=opt.pt, FPGA=opt.FPGA)
         model.to('cpu')
         model.fuse(quantized=opt.quantized, FPGA=opt.FPGA)
+        if opt.quantized == 5:
+            model.fuse_layer_norm()
+            #model.set_quantized_weights()
         model.to('cuda:0')
             
     if t_cfg:
@@ -369,13 +372,13 @@ def train(hyp,opt):
     #                                          collate_fn=dataset.collate_fn)                                          )
     dataloader = torch.utils.data.DataLoader(dataset,
                                             batch_size=batch_size,
-                                            num_workers=1,
+                                            num_workers=2,
                                             pin_memory=True,
                                             collate_fn=dataset.collate_fn)    
     # Testloader
     testloader = torch.utils.data.DataLoader(testset,
                                             batch_size=batch_size,
-                                            num_workers=1,
+                                            num_workers=2,
                                             pin_memory=True,
                                             collate_fn=dataset.collate_fn)  
                     
@@ -526,19 +529,6 @@ def train(hyp,opt):
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            if opt.SWIFT:
-                if hasattr(model, 'module'):
-                    for i, (mdef, module) in enumerate(zip(model.module.module_defs[:], model.module.module_list[:])):
-                        if mdef['type'] == 'convolutional':
-                            if mdef['activation'] != 'linear':
-                                conv_layer_weight = module[0].weight
-                                conv_layer_weight.grad[conv_layer_weight == 0] = 0
-                else:
-                    for i, (mdef, module) in enumerate(zip(model.module_defs[:], model.module_list[:])):
-                        if mdef['type'] == 'convolutional':
-                            if mdef['activation'] != 'linear':
-                                conv_layer_weight = module[0].weight
-                                conv_layer_weight.grad[conv_layer_weight == 0] = 0
             # 对要剪枝层的γ参数稀疏化
             if hasattr(model, 'module'):
                 if opt.prune != -1:
@@ -569,7 +559,7 @@ def train(hyp,opt):
                 if not os.path.isdir('train_sample/'):
                     os.makedirs('train_sample/')
                 f = 'train_sample/train_batch%g.jpg' % epoch  # filename
-                res = plot_images(images=imgs, targets=targets, paths=paths, fname=f, is_gray_scale=opt.gray_scale)
+                res = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
                 if tb_writer:
                     tb_writer.add_image(f, res, dataformats='HWC', global_step=epoch)
                     # tb_writer.add_graph(model, imgs)  # add model to tensorboard
@@ -603,7 +593,7 @@ def train(hyp,opt):
 
         final_epoch = epoch + 1 == epochs
         if not opt.notest or final_epoch:  # Calculate mAP
-            model.fuse_norm()
+            model.set_layer_norm()
             is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
             results, maps = test_py.test(cfg,
                                       data,
@@ -619,9 +609,7 @@ def train(hyp,opt):
                                       w_bit=opt.w_bit,
                                       FPGA=opt.FPGA,
                                       rank=opt.local_rank,
-                                      plot=False,
                                       img_outpath=opt.test_img_outpath)
-        torch.cuda.empty_cache()
 
         # Write
         with open(results_file, 'a') as f:

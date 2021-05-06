@@ -11,17 +11,17 @@ from utils.utils import *
 def _create_parser():
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--model', type=str, default=None, help='model path') #'pt_models/dorefa.pt'
-    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-quant.cfg', help='*.cfg path')
+    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-fused.cfg', help='*.cfg path')
     parser.add_argument('--data', type=str, default='data/coco2017_val_split.data', help='*.data path')
-    parser.add_argument('--weights', type=str, default='weights/last_v3_ql4.pt', help='weights path')
-    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
+    parser.add_argument('--weights', type=str, default='weights/retrain_q_weights.pt', help='weights path')
+    parser.add_argument('--batch-size', type=int, default=4, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
     parser.add_argument('--img_outpath', type=str, default='./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
     parser.add_argument('--task', default='test', help="'test', 'study', 'benchmark'")
-    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
+    parser.add_argument('--device', default='cpu', help='device id (i.e. 0 or 0,1) or cpu')
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--quantized', type=int, default=5,
@@ -30,7 +30,7 @@ def _create_parser():
                         help='a-bit')
     parser.add_argument('--w-bit', type=int, default=8,
                         help='w-bit')
-    parser.add_argument('--FPGA', action='store_true', help='FPGA')
+    parser.add_argument('--FPGA', type=bool, default=True)#action='store_true', help='FPGA')
     parser.add_argument('--load_model', type=str, default=None, help='weights saved as model')
     return parser.parse_args()    
 
@@ -52,11 +52,12 @@ def test(cfg,
          w_bit=8,
          FPGA=False,
          rank=None,
-         plot=True,
-         is_gray_scale=False):
          img_outpath=None,
          load_model=None):
     # Initialize/load model and set device
+    if FPGA:
+        opt.device = 'cpu'
+    
     if model is None:
         device = torch_utils.select_device(opt.device, batch_size=batch_size)
         verbose = opt.task == 'test'
@@ -67,7 +68,7 @@ def test(cfg,
 
         # Initialize model
         model = Darknet(cfg, imgsz, quantized=quantized, a_bit=a_bit, w_bit=w_bit,
-                        FPGA=FPGA, is_gray_scale=opt.gray_scale)
+                        FPGA=FPGA)
 
         # Load weights
         #attempt_download(weights)
@@ -100,8 +101,9 @@ def test(cfg,
 
         # Fuse
         model.fuse(quantized=quantized, FPGA=opt.FPGA)
-        print(model)
-        model.to('cuda:0')
+        model.fuse_layer_norm()
+        #print(model)
+        model.to(opt.device)
 
         if device.type != 'cpu' and torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -152,6 +154,7 @@ def test(cfg,
     jdict, stats, ap, ap_class = [], [], [], []
     for batch_i, (imgs, targets, paths, shapes) in enumerate(pbar):
         imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+        #imgs /= 16.0
         targets = targets.to(device)
         nb, _, height, width = imgs.shape  # batch size, channels, height, width
         whwh = torch.Tensor([width, height, width, height]).to(device)
@@ -315,7 +318,6 @@ if __name__ == '__main__':
     opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
     opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
     model = None
-    #opt.FPGA = True
     if opt.model != None:
         model = torch.load(opt.model)
 

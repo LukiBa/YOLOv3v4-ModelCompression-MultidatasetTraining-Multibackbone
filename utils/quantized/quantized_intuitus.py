@@ -8,6 +8,7 @@ from torch.nn import init
 from torch.nn.parameter import Parameter
 from torch.autograd import Function
 import torch as tc
+import IntuitusExtension as C_impl
 
 
 class Round(Function):
@@ -25,39 +26,73 @@ class Round(Function):
 
 # ********************* Activation Quantization ***********************
 class activation_quantize(nn.Module):
-    def __init__(self, a_bits):
+    def __init__(self, clip_only=False):
         super().__init__() 
+        self.clip_only = clip_only
+        self.eps = 1e-5
 
     def round(self, input):
         output = Round.apply(input)
         return output
 
     def forward(self, input):
-        #return input
+        if self.clip_only:
+            return self.intuitus_clip_activation(input)     
         return self.intuiuts_quantize_activation(input)
 
     def intuiuts_quantize_activation(self,activation):
         mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=activation.device)
-        exp_width = tc.tensor(3.0,dtype=tc.float32,device=activation.device)           
-        #sign = tc.where(activation<0.0,1.0,0.0)
-        value = tc.abs(activation)
-        exp = tc.where(value==0.0,(2.0**exp_width)-1.0,(-1.0)*tc.log2(value))
-        exp = tc.floor(tc.clip(exp,0.0,2.0**(exp_width)-1.0))                
-        mantissa = tc.round(activation*2.0**(exp+mantissa_width))
+        exp_width = tc.tensor(3.0,dtype=tc.float32,device=activation.device)     
+        exp_zero_shift = tc.tensor(3.0,dtype=tc.float32,device=activation.device) 
+        value = tc.abs(activation) + self.eps 
+        exp = tc.floor(tc.clip((-1)*tc.log2(value)+exp_zero_shift,0,2.0**(exp_width)-1.0))
+        mantissa = tc.round(activation*2.0**(exp-exp_zero_shift+mantissa_width))
         mantissa = tc.clip(mantissa,(-1.0)*((2.0**mantissa_width)-1.0),(2.0**mantissa_width)-1.0)
-        #q_value = tc.where(sign==0.0,mantissa*2.0**((-1.0)*exp-mantissa_width),(-1.0)*mantissa*2.0**((-1.0)*exp-mantissa_width))
-        return mantissa*2.0**((-1.0)*exp-mantissa_width)  
+        return mantissa*2.0**(-exp+exp_zero_shift-mantissa_width)  
+
+    def intuitus_clip_activation(self,activation):
+        mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=activation.device)
+        exp_width = tc.tensor(3.0,dtype=tc.float32,device=activation.device)  
+        exp_zero_shift = tc.tensor(4.0,dtype=tc.float32,device=activation.device)  
+        q_min = 2.0**(-(2.0**exp_width-1.0)-mantissa_width+exp_zero_shift)
+        q_max = 15.0*2.0**(-mantissa_width+exp_zero_shift)
+        
+        sign = activation.sign()
+        activation_clip = tc.clamp(tc.abs(activation),q_min, q_max)
+        activation_clip = tc.where(activation.abs()<q_min/2.0,tc.tensor(0.0,dtype=tc.float32,device=activation.device),activation_clip)
+        activation_clip *= sign
+        return activation_clip       
+
+    def get_float8(self,activation):
+        mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=activation.device)
+        exp_width = tc.tensor(3.0,dtype=tc.float32,device=activation.device)     
+        exp_zero_shift = tc.tensor(4.0,dtype=tc.float32,device=activation.device) 
+        value = tc.abs(activation) + self.eps 
+        exp = tc.floor(tc.clip((-1)*tc.log2(value)+exp_zero_shift,0,2.0**(exp_width)-1.0))
+        mantissa = tc.round(activation*2.0**(exp-exp_zero_shift+mantissa_width))
+        mantissa = tc.clip(mantissa,(-1.0)*((2.0**mantissa_width)-1.0),(2.0**mantissa_width)-1.0)
+        return exp.type(tc.int8), mantissa.type(tc.int8) 
+    def to_float(self,np_exp,np_mantissa,device='cpu'):
+        mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=device)    
+        exp_zero_shift = tc.tensor(3.0,dtype=tc.float32,device=device) 
+        exp = tc.tensor(np_exp,dtype=tc.float32,device=device)    
+        mantissa = tc.tensor(np_mantissa,dtype=tc.float32,device=device)         
+        
+        return mantissa*2.0**(-exp+exp_zero_shift-mantissa_width)        
 
 # ********************* Weight Quantization ***********************
 class weight_quantize(nn.Module):
-    def __init__(self, w_bits):
+    def __init__(self, clip_only=False):
         super().__init__()
-        
+        self.clip_only = clip_only
+        self.eps = 1e-5
     def round(self, input):
         output = Round.apply(input)
         return output
 
     def forward(self, input):
+        if self.clip_only:
+            return self.intuitus_clip_weights(input)     
         return self.intuitus_quantize_weights(input)
 
     def get_weights(self, input):
@@ -69,120 +104,97 @@ class weight_quantize(nn.Module):
     def intuitus_quantize_weights(self,weights):
         mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=weights.device)
         exp_width = tc.tensor(1.0,dtype=tc.float32,device=weights.device)        
-        self.exp_shift = 2.0 + tc.round(tc.log2(tc.sqrt(torch.abs(tc.mean(weights**2,dim=(1,2,3))))))
-        shift_divider = 2.0**((-1)*self.exp_shift.view(-1, 1, 1, 1))
-        weight_shift = weights*shift_divider
-        #sign = tc.where(weights<0.0,1.0,0.0)
-        value = tc.abs(weight_shift)
+        exp_shift = 2.0 + tc.round(tc.log2(tc.sqrt(tc.mean(weights**2,dim=(1,2,3))+self.eps)))
+        exp_shift = tc.clip(exp_shift,tc.tensor(-2.0,dtype=tc.float32,device=weights.device),tc.tensor(1.0,dtype=tc.float32,device=weights.device))
+        shift_multiplier = 2.0**((-1)*exp_shift.view(-1, 1, 1, 1))  
+        weight_shift = weights*shift_multiplier
+        value = tc.abs(weight_shift) + self.eps
         exp = tc.where(value==0.0,(2.0**exp_width)-1.0,(-1.0)*tc.log2(value))
         exp = tc.floor(tc.clip(exp,0.0,2.0**(exp_width)-1.0))                
         mantissa = tc.round(weight_shift*2.0**(exp+mantissa_width))
         mantissa = tc.clip(mantissa,(-1.0)*((2.0**mantissa_width)-1.0),(2.0**mantissa_width)-1.0)
-        #q_value = tc.where(sign==0.0,mantissa*2.0**((-1.0)*exp-mantissa_width),(-1.0)*mantissa*2.0**((-1.0)*exp-mantissa_width)) 
-        q_value = mantissa*2.0**((-1.0)*exp-mantissa_width)
-        return q_value, self.exp_shift      
+        q_value = mantissa*2.0**(-exp-mantissa_width)
+        return q_value, exp_shift      
+
+    def intuitus_clip_weights(self,weights):
+        mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=weights.device)  
+        q_min = 2.0**(-1.0-mantissa_width)
+        q_max = 15.0*2.0**(-mantissa_width)
+        exp_shift = 2.0 + tc.round(tc.log2(tc.sqrt(tc.mean(weights**2,dim=(1,2,3))+self.eps)))
+        exp_shift = tc.clip(exp_shift,tc.tensor(-2.0,dtype=tc.float32,device=weights.device),tc.tensor(1.0,dtype=tc.float32,device=weights.device))
+        shift_multiplier = 2.0**((-1)*exp_shift.view(-1, 1, 1, 1))  
+        weight_shift = weights*shift_multiplier
+        
+        sign = weight_shift.sign()
+        weight_clip = tc.clamp(tc.abs(weight_shift),q_min, q_max)
+        weight_clip = tc.where(weight_shift.abs()<q_min/2.0,tc.tensor(0.0,dtype=tc.float32,device=weights.device),weight_clip)
+        weight_clip *= sign
+        return weight_clip, exp_shift   
+    
+    def get_float6(self,weights):
+        mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=weights.device)
+        exp_width = tc.tensor(1.0,dtype=tc.float32,device=weights.device)        
+        exp_shift = 2.0 + tc.round(tc.log2(tc.sqrt(tc.mean(weights**2,dim=(1,2,3))+self.eps)))
+        exp_shift = tc.clip(exp_shift,tc.tensor(-2.0,dtype=tc.float32,device=weights.device),tc.tensor(1.0,dtype=tc.float32,device=weights.device))
+        shift_multiplier = 2.0**((-1)*exp_shift.view(-1, 1, 1, 1))  
+        weight_shift = weights*shift_multiplier
+        value = tc.abs(weight_shift) + self.eps
+        exp = tc.where(value==0.0,(2.0**exp_width)-1.0,(-1.0)*tc.log2(value))
+        exp = tc.floor(tc.clip(exp,0.0,2.0**(exp_width)-1.0))                
+        mantissa = tc.round(weight_shift*2.0**(exp+mantissa_width))
+        mantissa = tc.clip(mantissa,(-1.0)*((2.0**mantissa_width)-1.0),(2.0**mantissa_width)-1.0)
+        return exp.type(tc.int8), mantissa.type(tc.int8), exp_shift 
+
     
 # ********************* Bias Quantization ***********************
 class bias_quantize(nn.Module):
-    def __init__(self, b_bits):
+    def __init__(self, clip_only):
         super().__init__()
+        self.clip_only = clip_only
         
     def round(self, input):
         output = Round.apply(input)
         return output
 
     def forward(self, input ,weight_exp_shift):
-        bias_shift = input*(2.0**((-1)*weight_exp_shift))
-        return self.intuiuts_quantize_activation(bias_shift)
+        if self.clip_only:
+            return self.intuitus_clip_bias(input,weight_exp_shift)
+        return self.intuitus_quantize_bias(input,weight_exp_shift)
 
     def get_bias(self, input ,weight_exp_shift):
-        bias_shift = input*(2.0**((-1)*weight_exp_shift))
-        return self.intuiuts_quantize_activation(bias_shift)        
-        #return self.intuitus_quantize_bias(input,weight_exp_shift)
+        return self.intuitus_quantize_bias(input,weight_exp_shift)
     
     def get_quantize_value(self,input,weight_exp_shift):
-        bias_shift = input*(2.0**((-1)*weight_exp_shift))
-        return self.intuiuts_quantize_activation(bias_shift)        
-        #return self.intuitus_quantize_bias(input,weight_exp_shift)
+        return self.intuitus_quantize_bias(input,weight_exp_shift)
+    
 
     def intuitus_quantize_bias(self,bias,weight_exp_shift):
         bias_width = tc.tensor(4.0,dtype=tc.float32,device=bias.device)
-        exponent =tc.tensor(0.0,dtype=tc.float32,device=bias.device)        
+        exponent =tc.tensor(3.0,dtype=tc.float32,device=bias.device)        
         bias_shift = bias*(2.0**((-1)*weight_exp_shift))
         bias_mantissa = tc.round(2.0**(exponent+bias_width-1.0)*bias_shift)
         bias_mantissa = tc.clip(bias_mantissa,(-1.0)*2.0**(bias_width-1.0),2.0**(bias_width-1.0)-1.0)
-        return bias_mantissa*2.0**((-1.0)*exponent-bias_width+1.0)
-    
-    def intuiuts_quantize_activation(self,activation):
-        mantissa_width = tc.tensor(4.0,dtype=tc.float32,device=activation.device)
-        exp_width = tc.tensor(3.0,dtype=tc.float32,device=activation.device)           
-        #sign = tc.where(activation<0.0,1.0,0.0)
-        value = tc.abs(activation)
-        exp = tc.where(value==0.0,(2.0**exp_width)-1.0,(-1.0)*tc.log2(value))
-        exp = tc.floor(tc.clip(exp,0.0,2.0**(exp_width)-1.0))                
-        mantissa = tc.round(activation*2.0**(exp+mantissa_width))
-        mantissa = tc.clip(mantissa,(-1.0)*((2.0**mantissa_width)-1.0),(2.0**mantissa_width)-1.0)
-        #q_value = tc.where(sign==0.0,mantissa*2.0**((-1.0)*exp-mantissa_width),(-1.0)*mantissa*2.0**((-1.0)*exp-mantissa_width))
-        return mantissa*2.0**((-1.0)*exp-mantissa_width)      
+        return bias_mantissa*2.0**((-1.0)*exponent-bias_width+1.0)  
 
-
-# ********************* Quantized convlolution. Quantize W and Activation before convolution ***********************
-class Intuitus_BachNorm2d(nn.BatchNorm2d):
-
-    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True,
-                 track_running_stats=True):
-        super(Intuitus_BachNorm2d, self).__init__(
-            num_features, eps, momentum, affine, track_running_stats)
-        self.layer_norm = tc.tensor(1.0,dtype=tc.float32)
-        self.bias_quantizer = bias_quantize(4)
-
-    def normalize_parameter(self): # execute this function if new weights and biases are loaded --> do not execute during training --> may delete training progress
-        # the goal is to keep the results inside the quantization window
-        layer_norm = tc.sqrt(torch.abs(torch.var(self.weight)*2+tc.mean(self.weight)))+self.eps # eps used to avoid zero division error
-        norm_weight = self.weight/layer_norm
-        norm_bias = self.bias/layer_norm
-        self.weight.data.copy_(norm_weight)
-        q_bias = self.bias_quantizer(norm_bias,0)
-        self.bias.data.copy_(q_bias)
-        self.layer_norm.copy_(self.layer_norm*layer_norm)
+    def intuitus_clip_bias(self,bias,weight_exp_shift):
+        bias_width = tc.tensor(4.0,dtype=tc.float32,device=bias.device)
+        exponent =tc.tensor(3.0,dtype=tc.float32,device=bias.device)      
+        q_min = 2.0**(-exponent-bias_width)
+        q_max = 15.0*2.0**(-exponent-bias_width)
         
-
-    def forward(self, input):
-        self._check_input_dim(input)
-
-        exponential_average_factor = 0.0
-
-        if self.training and self.track_running_stats:
-            if self.num_batches_tracked is not None:
-                self.num_batches_tracked += 1
-                if self.momentum is None:  # use cumulative moving average
-                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
-                else:  # use exponential moving average
-                    exponential_average_factor = self.momentum
-
-        # calculate running estimates
-        if self.training:
-            mean = input.mean([0, 2, 3])
-            # use biased var in train
-            var = input.var([0, 2, 3], unbiased=False)
-            n = input.numel() / input.size(1)
-            with torch.no_grad():
-                self.running_mean.copy_(exponential_average_factor * mean\
-                    + (1 - exponential_average_factor) * self.running_mean)
-                # update running_var with unbiased var
-                self.running_var.copy_(exponential_average_factor * var * n / (n - 1)\
-                    + (1 - exponential_average_factor) * self.running_var)
-        else:
-            mean = self.running_mean
-            var = self.running_var
-
+        bias_shift = bias*(2.0**((-1)*weight_exp_shift))
         
-        input = (input - mean[None, :, None, None]) / (torch.sqrt(torch.abs(var[None, :, None, None]*3)) + self.eps)
-        if self.affine:
-            input = input * self.weight[None, :, None, None] + self.bias[None, :, None, None]
-
-        return input
-
+        sign = bias_shift.sign()
+        bias_shift = bias_shift.abs_().clamp_(q_min, q_max)
+        bias_shift *= sign
+        return bias_shift 
+    def get_fixed4(self,bias,weight_exp_shift):
+        bias_width = tc.tensor(4.0,dtype=tc.float32,device=bias.device)
+        exponent =tc.tensor(3.0,dtype=tc.float32,device=bias.device)        
+        bias_shift = bias*(2.0**((-1)*weight_exp_shift))
+        bias_mantissa = tc.round(2.0**(exponent+bias_width-1.0)*bias_shift)
+        bias_mantissa = tc.clip(bias_mantissa,(-1.0)*2.0**(bias_width-1.0),2.0**(bias_width-1.0)-1.0)      
+        return bias_mantissa.type(tc.int8)
 
 class IntuitusConv2d(nn.Conv2d):
     def __init__(
@@ -196,13 +208,13 @@ class IntuitusConv2d(nn.Conv2d):
             groups=1,
             bias=True,
             normalize_weights=False,
+            clip_weights=False,
             quantize_weights=False,
+            clip_activations=False,
             quantize_activations=False,
             fold_bn = False,
-            momentum = 0.1,
-            a_bits=8,
-            w_bits=8,
-    ):
+            freeze = False,
+            momentum = 0.1):
         super().__init__(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -214,18 +226,18 @@ class IntuitusConv2d(nn.Conv2d):
             bias=bias
         )
         # Define A and W quantizer
-        self.activation_quantizer = activation_quantize(a_bits=a_bits)
-        self.weight_quantizer = weight_quantize(w_bits=w_bits)
+        self.activation_quantizer = activation_quantize(clip_only=clip_activations)
+        self.weight_quantizer = weight_quantize(clip_only=clip_weights)
         if bias == True: 
-            self.bias_quantizer = bias_quantize(b_bits=w_bits)
+            self.bias_quantizer = bias_quantize(clip_only=clip_weights)
         self.quantized = False
         self.normalized = not normalize_weights
-        self.quantize_weights = quantize_weights
-        self.quantize_activations = quantize_activations
-        self.layer_norm = tc.tensor(1.0,dtype=tc.float32)
+        self.quantize_weights = quantize_weights or clip_weights
+        self.quantize_activations = quantize_activations or clip_activations
+        #self.layer_norm = tc.tensor(1.0,dtype=tc.float32)
         self.layer_norm_dyn = tc.tensor(1.0,dtype=tc.float32)
         self.weight_exp_shift = tc.zeros([out_channels], dtype=torch.float32)
-        # self.register_buffer('layer_norm', torch.zeros(out_channels))
+        self.layer_norm = nn.Parameter(tc.tensor(1.0,dtype=tc.float32),requires_grad=False)
         # self.register_buffer('layer_norm_dyn', tc.tensor(1.0,dtype=tc.float32))
         # self.register_buffer('weight_exp_shift', tc.tensor(1.0,dtype=tc.float32))
         self.use_bias = bias
@@ -235,38 +247,34 @@ class IntuitusConv2d(nn.Conv2d):
         self.running_var = tc.tensor(1.0,dtype=tc.float32)
         self.eps = 1e-5
         self.first_run = True 
+        self.freeze = freeze
+        self.clip_weights=clip_weights
+        self.clip_activations=clip_activations
+        # for param in self.parameters():
+        #     param.requires_grad = not freeze
 
-    def fuse_norm(self):
+    def set_quantized_weights(self):
+        if self.quantize_weights and not self.clip_weights:
+            q_weight, weight_exp_shift = self.weight_quantizer(self.weight)
+            if self.use_bias == True:
+                q_bias = self.bias_quantizer(self.bias,weight_exp_shift)
+            else:
+                q_bias = self.bias
+            self.weight.data.copy_(q_weight*2.0**(weight_exp_shift).view(-1, 1, 1, 1))
+            self.bias.data.copy_(q_bias*2.0**(weight_exp_shift))
+
+    def set_layer_norm(self):
         if not self.normalized:
             print("running mean: {}, running variance {}".format(self.running_mean,self.running_var))
             weight = self.weight/tc.sqrt(tc.abs(self.running_var)*3.0 + self.eps)
             bias = (self.bias - self.running_mean)/tc.sqrt(tc.abs(self.running_var)*3.0 + self.eps)
             self.bias.data.copy_(bias)
             self.weight.data.copy_(weight)
+            self.layer_norm.data.copy_(self.layer_norm.mul(tc.sqrt(tc.abs(self.running_var)*3.0 + self.eps)))
             self.running_mean = tc.tensor(0.0,dtype=tc.float32)
             self.running_var = tc.tensor(0.3333333,dtype=tc.float32)
+            
             self.first_run = False
-
-    def normalize_weights_and_bias(self):
-        layer_norm = (tc.sqrt(tc.abs(torch.var(self.weight)*2.0+tc.mean(self.weight)))*2.0)+self.eps # eps used to avoid zero division error
-        norm_weight = self.weight/layer_norm
-        self.weight.data.copy_(norm_weight)
-        if self.bias != None:
-            norm_bias = self.bias/layer_norm
-            self.bias.data.copy_(norm_bias)
-        
-        self.layer_norm.copy_(self.layer_norm*layer_norm)
-        
-    def quantize_weights_and_bias(self): # execute this function if new weights and biases are loaded --> do not execute during training --> may delete training progress
-        if self.normalized == False:
-            self.normalize_weights_and_bias()
-        
-        q_weight, weight_exp_shift = self.weight_quantizer(self.weight)
-        self.weight_exp_shift.copy_(weight_exp_shift)
-        self.weight.data.copy_(q_weight)
-        if self.use_bias == True:
-            q_bias = self.bias_quantizer(self.bias,weight_exp_shift) 
-            self.bias.data.copy_(q_bias)
 
     def forward(self, input):
         if self.weight_exp_shift.device != input.device:
@@ -276,7 +284,9 @@ class IntuitusConv2d(nn.Conv2d):
                 
         if not self.normalized and self.training:
             #self.normalize_weights_and_bias()
-
+            for param in self.parameters():
+                param.requires_grad = False
+                
             output = F.conv2d(
                 input=input,
                 weight=self.weight,
@@ -297,20 +307,12 @@ class IntuitusConv2d(nn.Conv2d):
                 else:
                     self.running_mean = self.running_mean + (batch_mean-self.running_mean)*self.momentum 
                     self.running_var = self.running_var + (batch_var-self.running_var)*self.momentum                 
-                weight = self.weight/tc.sqrt(tc.abs(self.running_var)*3.0 + self.eps)
-                bias = (self.bias - self.running_mean)/tc.sqrt(tc.abs(self.running_var)*3.0 + self.eps)
-
+                bias = self.bias
+                weight = self.weight
 
         else:
             bias = self.bias
             weight = self.weight            
-            
-            
-            
-            
-        
-        if input.shape[1] != 3 and self.quantize_activations:
-            input = self.activation_quantizer(input)
             
         if self.quantize_weights:
             q_weight, weight_exp_shift = self.weight_quantizer(weight)
@@ -318,10 +320,9 @@ class IntuitusConv2d(nn.Conv2d):
                 q_bias = self.bias_quantizer(bias,weight_exp_shift)
             else:
                 q_bias = bias
-            
-            mean_shift = tc.floor(tc.mean(self.weight_exp_shift+weight_exp_shift))
-            self.layer_norm_dyn = 2.0**(tc.floor(tc.mean(self.weight_exp_shift+weight_exp_shift)))
-            weight_exp_shift -= mean_shift
+            if self.clip_weights:
+                self.weight.data.copy_(q_weight*2.0**(weight_exp_shift).view(-1, 1, 1, 1))
+                self.bias.data.copy_(q_bias*2.0**(weight_exp_shift))
         else:
             q_weight = weight
             q_bias = bias
@@ -335,11 +336,18 @@ class IntuitusConv2d(nn.Conv2d):
             dilation=self.dilation,
             groups=self.groups
         )
+        output = output * self.layer_norm
+        
+        if self.quantize_activations:
+            output = self.activation_quantizer(output)        
+        
         if not self.quantize_weights:
             return output
         
-        mult = 2.0**(self.weight_exp_shift+weight_exp_shift)
+        mult = 2.0**(weight_exp_shift)
         output = output * mult.view(1,-1,1,1) 
+        if self.quantize_activations:
+            output = self.activation_quantizer(output)          
         return output
 
 def reshape_to_activation(input):
@@ -354,7 +362,7 @@ def reshape_to_bias(input):
     return input.reshape(-1)
 
 
-class BNFold_IntuitusConv2d(IntuitusConv2d):
+class FPGA_IntuitusConv2d(IntuitusConv2d):
 
     def __init__(
             self,
@@ -365,183 +373,72 @@ class BNFold_IntuitusConv2d(IntuitusConv2d):
             padding=0,
             dilation=1,
             groups=1,
-            bias=False,
-            eps=1e-5,
-            momentum=0.01,  # 考虑量化带来的抖动影响,对momentum进行调整(0.1 ——> 0.01),削弱batch统计参数占比，一定程度抑制抖动。经实验量化训练效果更好,acc提升1%左右
-            a_bits=8,
-            w_bits=8,
-            bn=0,
-            activate='leaky',
-            steps=0,
-    ):
+            bias=True,
+            normalize_weights=False,
+            clip_weights=False,
+            quantize_weights=False,
+            clip_activations=False,
+            quantize_activations=False,
+            fold_bn = False,
+            freeze = False,
+            momentum = 0.1):
         super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias
-        )
-        self.bn = bn
-        self.activate = activate
-        self.eps = eps
-        self.momentum = momentum
-        self.freeze_step = int(steps * 0.9)
-        self.gamma = Parameter(torch.Tensor(out_channels))
-        self.beta = Parameter(torch.Tensor(out_channels))
-        self.register_buffer('running_mean', torch.zeros(out_channels))
-        self.register_buffer('running_var', torch.zeros(out_channels))
-        self.register_buffer('batch_mean', torch.zeros(out_channels))
-        self.register_buffer('batch_var', torch.zeros(out_channels))
-        self.register_buffer('first_bn', torch.zeros(1))
-        self.register_buffer('step', torch.zeros(1))
-
-        init.normal_(self.gamma, 1, 0.5)
-        init.zeros_(self.beta)
-
-        # 实例化量化器（A-layer级，W-channel级） Quantisierer instanziieren
-        self.activation_quantizer = activation_quantize(a_bits=a_bits)
-        self.weight_quantizer = weight_quantize(w_bits=w_bits)
-        self.bias_quantizer = bias_quantize(b_bits=w_bits)
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=bias,
+                normalize_weights=normalize_weights,
+                clip_weights=clip_weights,
+                quantize_weights=quantize_weights,
+                clip_activations=clip_activations,
+                quantize_activations=quantize_activations,
+                fold_bn=fold_bn,
+                freeze=freeze,
+                momentum=momentum)
 
     def forward(self, input):
-        # 训练态
-        if self.training:
-            self.step += 1
-            if self.bn:
-                # 先做普通卷积得到A，以取得BN参数 First do ordinary convolution to get A to get BN parameters
-                output = F.conv2d(
-                    input=input,
-                    weight=self.weight,
-                    bias=self.bias,
-                    stride=self.stride,
-                    padding=self.padding,
-                    dilation=self.dilation,
-                    groups=self.groups
-                )
-                # 更新BN统计参数（batch和running）
-                dims = [dim for dim in range(4) if dim != 1]
-                self.batch_mean = torch.mean(output, dim=dims)
-                self.batch_var = torch.var(output, dim=dims)
-
-                with torch.no_grad():
-                    if self.first_bn == 0 and torch.equal(self.running_mean, torch.zeros_like(
-                            self.running_mean)) and torch.equal(self.running_var, torch.zeros_like(self.running_var)):
-                        self.first_bn.add_(1)
-                        self.running_mean.add_(self.batch_mean)
-                        self.running_var.add_(self.batch_var)
-                    else:
-                        self.running_mean.mul_(1 - self.momentum).add_(self.momentum * self.batch_mean)
-                        self.running_var.mul_(1 - self.momentum).add_(self.momentum * self.batch_var)
-                # BN融合 BN fold
-                if self.step < self.freeze_step:
-                    if self.bias is not None:
-                        bias = reshape_to_bias(
-                            self.beta + (self.bias - self.batch_mean) * (
-                                    self.gamma / torch.sqrt(tc.abs(self.batch_var + self.eps))))
-                    else:
-                        bias = reshape_to_bias(
-                            self.beta - self.batch_mean * (
-                                    self.gamma / torch.sqrt(tc.abs(self.batch_var + self.eps))))  # b融batch
-                    weight = self.weight * reshape_to_weight(
-                        self.gamma / torch.sqrt(torch.abs(self.batch_var + self.eps)))  # w融running
-                else:
-                    if self.bias is not None:
-                        bias = reshape_to_bias(
-                            self.beta + (self.bias - self.running_mean) * (
-                                    self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps))))
-                    else:
-                        bias = reshape_to_bias(
-                            self.beta - self.running_mean * (
-                                    self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps))))  # b融batch
-                    weight = self.weight * reshape_to_weight(
-                        self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps))) # w融running
-
-            else:
-                bias = self.bias
-                weight = self.weight
-        # 测试态
+           
+        w_exp, w_mant, weight_exp_shift = self.weight_quantizer.get_float6(self.weight)
+        if self.use_bias == True:
+            b_mant = self.bias_quantizer.get_fixed4(self.bias,weight_exp_shift)
         else:
-            # print(self.running_mean, self.running_var)
-            # BN融合
-            if self.bn:
-                if self.bias is not None:
-                    bias = reshape_to_bias(self.beta + (self.bias - self.running_mean) * (
-                            self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps))))
-                else:
-                    bias = reshape_to_bias(
-                        self.beta - self.running_mean * (
-                                self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps))))  # b融running
-                weight = self.weight * reshape_to_weight(
-                    self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps)))  # w融running
-            else:
-                bias = self.bias
-                weight = self.weight
-        # 量化A和bn融合后的W
+            b_mant = tc.zeros(weight_exp_shift.shape,dtype=tc.int8)
+            
+        if self.stride[0] != self.stride[1]:
+            raise NotImplementedError("Asymetric stride not supported yet.") 
+        stride = int(self.stride[0])
+        
+        a_exp, a_mant = self.activation_quantizer.get_float8(input)        
+        exp,mantissa =  C_impl.conv2d_fpga(a_exp.cpu().data.numpy(),a_mant.cpu().data.numpy(),
+                                       w_exp.cpu().data.numpy(),w_mant.cpu().data.numpy(), 
+                                       6, b_mant.cpu().data.numpy(),
+                                       weight_exp_shift.type(tc.int8).cpu().data.numpy(),
+                                       stride,1)            
+        
+        output = self.activation_quantizer.to_float(exp,mantissa)
+        
         q_weight, weight_exp_shift = self.weight_quantizer(self.weight)
-        self.weight_exp_shift = weight_exp_shift
-        q_bias = self.bias_quantizer(bias,0)
-        # 量化卷积
-        if self.training:  # 训练态
-            output = F.conv2d(
-                input=input,
-                weight=q_weight,
-                # bias=self.bias,  # 注意，这里不加bias（self.bias为None）
-                bias=q_bias,
-                stride=self.stride,
-                padding=self.padding,
-                dilation=self.dilation,
-                groups=self.groups
-            )
-
-        else:  # 测试态
-            output = F.conv2d(
-                input=input,
-                weight=q_weight,
-                bias=q_bias,  # 注意，这里加bias，做完整的conv+bn
-                stride=self.stride,
-                padding=self.padding,
-                dilation=self.dilation,
-                groups=self.groups
-            )
-        mult = (2.0**self.weight_exp_shift.view(1,-1,1,1))
-        output = output * mult 
-        if self.activate == 'leaky':
-            output = F.leaky_relu(output, 0.125, inplace=True)
-        elif self.activate == 'relu6':
-            output = F.relu6(output, inplace=True)
-        elif self.activate == 'h_swish':
-            output = output * (F.relu6(output + 3.0, inplace=True) / 6.0)
-        elif self.activate == 'relu':
-            output = F.relu(output, inplace=True)
-        elif self.activate == 'mish':
-            output = output * F.softplus(output).tanh()
-        elif self.activate == 'linear':
-            return output
-            # pass
+        if self.use_bias == True:
+            q_bias = self.bias_quantizer(self.bias,weight_exp_shift)
         else:
-            print(self.activate + " is not supported !")
-        output = self.activation_quantizer(output)
+            q_bias = self.bias        
+        compare = F.conv2d(
+            input=input,
+            weight=q_weight,
+            bias=q_bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups
+        )  
+        compare = F.relu(compare, inplace=True)
+    
+        
         return output
-
-    def BN_fuse(self):
-        if self.bn:
-            # BN融合
-            if self.bias is not None:
-                bias = reshape_to_bias(self.beta + (self.bias - self.running_mean) * (
-                        self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps))))
-            else:
-                bias = reshape_to_bias(
-                    self.beta - self.running_mean * self.gamma / torch.sqrt(
-                        self.running_var + self.eps))  # b融running
-            weight = self.weight * reshape_to_weight(
-                self.gamma / torch.sqrt(torch.abs(self.running_var + self.eps)))  # w融running
-        else:
-            bias = self.bias
-            weight = self.weight
-        return weight, bias
 
 
 class IntuitusLinear(nn.Linear):
@@ -551,10 +448,8 @@ class IntuitusLinear(nn.Linear):
         self.weight_quantizer = weight_quantize(w_bits=w_bits)
 
     def forward(self, input):
-        # 量化A和W
         q_input = self.activation_quantizer(input)
         q_weight, self.weight_exp_shift = self.weight_quantizer(self.weight)
-        # 量化全连接
         output = F.linear(input=q_input, weight=q_weight, bias=self.bias)
         #output = output * (2.0**self.weight_exp_shift)
         return output

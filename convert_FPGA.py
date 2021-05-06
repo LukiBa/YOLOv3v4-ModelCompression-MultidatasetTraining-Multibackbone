@@ -31,17 +31,16 @@ def _create_parser():
     
     return parser.parse_args()
 
-def convert():
 def convert(opt):
     img_size = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)
-    weights, half = opt.weights, opt.half
-
+    #weights, half = opt.weights, opt.half
+    weights = opt.weights
     # Initialize
     device = torch_utils.select_device(device='cpu' if ONNX_EXPORT else opt.device)
 
     # Initialize model
     model = Darknet(opt.cfg, img_size, quantized=opt.quantized, a_bit=opt.a_bit, w_bit=opt.w_bit,
-                    FPGA=opt.FPGA, is_gray_scale=opt.gray_scale)
+                    FPGA=opt.FPGA)
 
     # Load weights
     attempt_download(weights)

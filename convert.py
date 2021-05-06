@@ -26,7 +26,6 @@ def convert():
 
     # Eval mode
     model.to(device).eval()
-
     outpath = pathlib.Path(__file__).parent / opt.output
     outpath = outpath / (opt.cfg.split('/')[-1].replace('.cfg', '') + '.pt')
     torch.save(model,str(outpath))
@@ -35,9 +34,6 @@ def convert():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
-    parser.add_argument('--weights', type=str, default='weights/yolov3.weights', help='path to weights file')
-    parser.add_argument('--output', type=str, default='output', help='output folder')  # output folder
     parser.add_argument('--cfg', type=str, default='./cfg/yolov4tiny/yolov4-tiny.cfg', help='cfg file path')
     parser.add_argument('--weights', type=str, default='weights/yolov4-tiny.weights', help='path to weights file')
     parser.add_argument('--output', type=str, default='./pt_models', help='output folder')  # output folder
