@@ -6,31 +6,34 @@ from torch.utils.data import DataLoader
 from models import *
 from utils.datasets import *
 from utils.utils import *
+import torch
+import torch.utils
+import utils.quantized.quantized_intuitus_new as q_new
 
+torch.set_default_dtype(torch.float32)
+DEVICE = 'cpu'
 
 def _create_parser():
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--model', type=str, default=None, help='model path') #'pt_models/dorefa.pt'
-    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-fused.cfg', help='*.cfg path')
+    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-quant.cfg', help='*.cfg path')
     parser.add_argument('--data', type=str, default='data/coco2017_val_split.data', help='*.data path')
-    parser.add_argument('--weights', type=str, default='weights/retrain_q_weights.pt', help='weights path')
+    parser.add_argument('--weights', type=str, default='weights/rt.pt', help='weights path')
     parser.add_argument('--batch-size', type=int, default=4, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
-    parser.add_argument('--img_outpath', type=str, default='./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
+    parser.add_argument('--img_outpath', type=str, default=None)#'./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
+    parser.add_argument('--param_outpath', type=str, default='./parameters/int8_6')#'./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
     parser.add_argument('--task', default='test', help="'test', 'study', 'benchmark'")
-    parser.add_argument('--device', default='cpu', help='device id (i.e. 0 or 0,1) or cpu')
+    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
-    parser.add_argument('--quantized', type=int, default=5,
-                        help='0:quantization way one Ternarized weight and 8bit activation')
-    parser.add_argument('--a-bit', type=int, default=8,
-                        help='a-bit')
-    parser.add_argument('--w-bit', type=int, default=8,
-                        help='w-bit')
-    parser.add_argument('--FPGA', type=bool, default=True)#action='store_true', help='FPGA')
+    parser.add_argument('--quantized', type=int, default=6,help='0:quantization way one Ternarized weight and 8bit activation')
+    parser.add_argument('--a-bit', type=int, default=8, help='a-bit')
+    parser.add_argument('--w-bit', type=int, default=6, help='w-bit')
+    parser.add_argument('--FPGA', type=bool, default=False)#action='store_true', help='FPGA')
     parser.add_argument('--load_model', type=str, default=None, help='weights saved as model')
     return parser.parse_args()    
 
@@ -53,11 +56,11 @@ def test(cfg,
          FPGA=False,
          rank=None,
          img_outpath=None,
+         param_outpath=None,
          load_model=None):
-    # Initialize/load model and set device
-    if FPGA:
-        opt.device = 'cpu'
     
+    torch.cuda.empty_cache()
+    # Initialize/load model and set device
     if model is None:
         device = torch_utils.select_device(opt.device, batch_size=batch_size)
         verbose = opt.task == 'test'
@@ -69,6 +72,11 @@ def test(cfg,
         # Initialize model
         model = Darknet(cfg, imgsz, quantized=quantized, a_bit=a_bit, w_bit=w_bit,
                         FPGA=FPGA)
+
+        if FPGA:
+            dev = 'cpu'
+        else:
+            dev = DEVICE 
 
         # Load weights
         #attempt_download(weights)
@@ -101,9 +109,8 @@ def test(cfg,
 
         # Fuse
         model.fuse(quantized=quantized, FPGA=opt.FPGA)
-        model.fuse_layer_norm()
         #print(model)
-        model.to(opt.device)
+        model.to(dev)
 
         if device.type != 'cpu' and torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -143,7 +150,7 @@ def test(cfg,
                                 collate_fn=dataset.collate_fn)
 
     seen = 0
-    model.eval()
+    
     # _ = model(torch.zeros((1, 3, imgsz, imgsz), device=device)) if device.type != 'cpu' else None  # run once
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
@@ -152,9 +159,16 @@ def test(cfg,
     pbar = tqdm(dataloader, desc=s)
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
+        
+    model.to(DEVICE)
+    model.eval()
+    
     for batch_i, (imgs, targets, paths, shapes) in enumerate(pbar):
-        imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
-        #imgs /= 16.0
+        
+        imgs = imgs.to(device).float()
+        #if opt.quantized != 5:
+        imgs = imgs/255.0
+
         targets = targets.to(device)
         nb, _, height, width = imgs.shape  # batch size, channels, height, width
         whwh = torch.Tensor([width, height, width, height]).to(device)
@@ -304,6 +318,10 @@ def test(cfg,
             print('WARNING: pycocotools must be installed with numpy==1.17 to run correctly. '
                   'See https://github.com/cocodataset/cocoapi/issues/356')
 
+    # Write Parameter to txt 
+    if param_outpath != None:
+        model.write_parameter_to_txt(param_outpath)
+    
     # Return results
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
@@ -340,6 +358,7 @@ if __name__ == '__main__':
              a_bit=opt.a_bit,
              w_bit=opt.w_bit,
              FPGA=opt.FPGA,
+             param_outpath = opt.param_outpath,
              img_outpath = opt.img_outpath,
              load_model = opt.load_model)
         

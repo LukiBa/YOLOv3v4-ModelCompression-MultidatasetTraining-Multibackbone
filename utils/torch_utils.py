@@ -105,9 +105,15 @@ def fuse_conv_and_bn(conv, bn, quantized=-1, FPGA=False):
                                         kernel_size=conv.kernel_size,
                                         stride=conv.stride,
                                         padding=conv.padding,
-                                        bias=True)
-            fusedconv.weight_quantizer = deepcopy(conv.weight_quantizer)
-            fusedconv.activation_quantizer = deepcopy(conv.activation_quantizer)            
+                                        bias=True,
+                                        quantize_weights = conv.quantize_weights,
+                                        clip_weights = conv.clip_weights,
+                                        normalize_weights = conv.normalize,
+                                        quantize_activations=conv.quantize_activations,
+                                        clip_activations=conv.clip_activations,                                       
+                                        )
+            #fusedconv.weight_quantizer = deepcopy(conv.weight_quantizer)
+            #fusedconv.activation_quantizer = deepcopy(conv.activation_quantizer)            
         else:
             #print("BN fuse error!")
             return
@@ -125,9 +131,6 @@ def fuse_conv_and_bn(conv, bn, quantized=-1, FPGA=False):
         b_bn = bn.bias + (bn.weight*(b_conv-bn.running_mean))/(torch.sqrt(bn.running_var + bn.eps))
         #b_bn = bn.bias
         fusedconv.bias.copy_(b_bn) #torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
-        
-        if quantized == 5 and isinstance(conv,IntuitusConv2d):
-            fusedconv.normalize_weights_and_bias() # start training from quantized weights and bias
 
         return fusedconv
 

@@ -9,3 +9,6 @@ __pycache__
 results.png
 results.txt
 weights
+parameters
+runs
+train_sample

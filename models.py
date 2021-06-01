@@ -5,27 +5,28 @@ from utils.quantized.quantized_dorefa import *
 from utils.quantized.quantized_ptq import *
 from utils.quantized.quantized_ptq_cos import *
 from utils.quantized.quantized_intuitus import *
+import utils.quantized.quantized_intuitus_new as q_new
 from utils.layers import *
 from collections import OrderedDict
 import copy
+import pathlib
+import shutil
+import numpy as np
 
 ONNX_EXPORT = False
 
 
 # YOLO
-def create_modules(module_defs, img_size, cfg, quantized, quantizer_output,reorder,TM,TN,a_bit=8, w_bit=8, FPGA=False, steps=0, is_gray_scale=False):
+def create_modules(module_defs, img_size, cfg, quantized, quantizer_output, a_bit=8, w_bit=8, FPGA=False, steps=0):
     # Constructs module list of layer blocks from module configuration in module_defs
 
     img_size = [img_size] * 2 if isinstance(img_size, int) else img_size  # expand if necessary
     _ = module_defs.pop(0)  # cfg training hyperparams (unused)
-    if is_gray_scale:
-        output_filters = [1]  # input channels
-    else:
-        output_filters = [3] 
-    
+    output_filters = [3]  # input channels
     module_list = nn.ModuleList()
     routs = []  # list of layers which rout to deeper layers
     yolo_index = -1
+    layer_norm_list = []
 
     for i, mdef in enumerate(module_defs):
         modules = nn.Sequential()
@@ -217,23 +218,22 @@ def create_modules(module_defs, img_size, cfg, quantized, quantizer_output,reord
                     quantize_activations = False 
                     clip_activations = False   
 
-                if quant_act > 2:
-                    modules.add_module('Conv2d', FPGA_IntuitusConv2d(output_filters[-1],filters,kernel_size))                    
-                    # modules.add_module('Conv2d', FPGA_IntuitusConv2d(
-                    #                                             in_channels=output_filters[-1],
-                    #                                             out_channels=filters,
-                    #                                             kernel_size=kernel_size,
-                    #                                             stride=int(mdef['stride']),
-                    #                                             padding=pad,
-                    #                                             groups=mdef['groups'] if 'groups' in mdef else 1,
-                    #                                             bias=not bn,
-                    #                                             fold_bn = fused,
-                    #                                             quantize_weights = quantize_weights,
-                    #                                             clip_weights = clip_weights,
-                    #                                             normalize_weights = normalize,
-                    #                                             quantize_activations=quantize_activations,
-                    #                                             clip_activations=clip_activations,
-                    #                                             freeze=freeze))
+                if quant_act > 2:                 
+                    modules.add_module('Conv2d', FPGA_IntuitusConv2d(
+                                                                in_channels=output_filters[-1],
+                                                                out_channels=filters,
+                                                                kernel_size=kernel_size,
+                                                                stride=int(mdef['stride']),
+                                                                padding=pad,
+                                                                groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                                bias=not bn,
+                                                                fold_bn = fused,
+                                                                quantize_weights = quantize_weights,
+                                                                clip_weights = clip_weights,
+                                                                normalize_weights = normalize,
+                                                                quantize_activations=quantize_activations,
+                                                                clip_activations=clip_activations,
+                                                                freeze=freeze))
                 else:                  
                     modules.add_module('Conv2d', IntuitusConv2d(in_channels=output_filters[-1],
                                                                 out_channels=filters,
@@ -265,6 +265,95 @@ def create_modules(module_defs, img_size, cfg, quantized, quantizer_output,reord
                         modules.add_module('activation', nn.ReLU())
                     if mdef['activation'] == 'mish':
                         modules.add_module('activation', Mish())
+                    # if mdef['activation'] == 'linear':
+                    #     modules.add_module('norm_multiplier', IntuitusNorm_Multiplier())
+                
+                # for i, layer in enumerate(modules):
+                #     if isinstance(layer, IntuitusConv2d) or isinstance(layer, IntuitusNorm_Multiplier):
+                #         if layer_norm_list != []:
+                #             layer.register_factorized_norm_observer(layer_norm_list[-1],layer_norm_list[-1].get_factorized_norm_oberserver)
+                #         layer_norm_list.append(layer)
+                
+                    
+                
+            elif quantized == 6:
+                if FPGA:
+                    modules.add_module('Conv2d', q_new.QuantizedConv2d_fpga(in_channels=output_filters[-1],
+                                                                            out_channels=filters,
+                                                                            kernel_size=kernel_size,
+                                                                            stride=int(mdef['stride']),
+                                                                            padding=pad,
+                                                                            groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                                            bias=not bn,
+                                                                            a_bits=a_bit,
+                                                                            w_bits=w_bit))
+                    if bn:                 
+                        raise NotImplementedError("Batchnorm not supported for FPGA. Fuse batchnorm first using quantization mode -1 (no quantization).")
+                else:
+                    modules.add_module('Conv2d', q_new.QuantizedConv2d(in_channels=output_filters[-1],
+                                                                       out_channels=filters,
+                                                                       kernel_size=kernel_size,
+                                                                       stride=int(mdef['stride']),
+                                                                       padding=pad,
+                                                                       groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                                       bias=not bn,
+                                                                       a_bits=a_bit,
+                                                                       w_bits=w_bit))
+                    if bn:
+                        modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.1))
+
+                if mdef['activation'] == 'leaky':
+                    modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
+                    # modules.add_module('activation', nn.PReLU(num_parameters=1, init=0.10))
+                    # modules.add_module('activation', Swish())
+                if mdef['activation'] == 'relu6':
+                    modules.add_module('activation', ReLU6())
+                if mdef['activation'] == 'h_swish':
+                    modules.add_module('activation', HardSwish())
+                if mdef['activation'] == 'relu':
+                    modules.add_module('activation', nn.ReLU(inplace=True))
+                if mdef['activation'] == 'mish':
+                    modules.add_module('activation', Mish())   
+            elif quantized == 7:
+                if FPGA:
+                    modules.add_module('Conv2d', q_new.QuantizedConv2d_post_shift_fpga(in_channels=output_filters[-1],
+                                                                            out_channels=filters,
+                                                                            kernel_size=kernel_size,
+                                                                            stride=int(mdef['stride']),
+                                                                            padding=pad,
+                                                                            groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                                            bias=not bn,
+                                                                            a_bits=a_bit,
+                                                                            w_bits=w_bit))
+                    if bn:                 
+                        raise NotImplementedError("Batchnorm not supported for FPGA. Fuse batchnorm first using quantization mode -1 (no quantization).")
+                else:
+                    modules.add_module('Conv2d', q_new.QuantizedConv2d_post_shift(in_channels=output_filters[-1],
+                                                                       out_channels=filters,
+                                                                       kernel_size=kernel_size,
+                                                                       stride=int(mdef['stride']),
+                                                                       padding=pad,
+                                                                       groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                                       bias=not bn,
+                                                                       a_bits=a_bit,
+                                                                       w_bits=w_bit))
+                    if bn:
+                        modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.1))
+
+                if mdef['activation'] == 'leaky':
+                    modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
+                    # modules.add_module('activation', nn.PReLU(num_parameters=1, init=0.10))
+                    # modules.add_module('activation', Swish())
+                if mdef['activation'] == 'relu6':
+                    modules.add_module('activation', ReLU6())
+                if mdef['activation'] == 'h_swish':
+                    modules.add_module('activation', HardSwish())
+                if mdef['activation'] == 'relu':
+                    modules.add_module('activation', nn.ReLU(inplace=True))
+                if mdef['activation'] == 'mish':
+                    modules.add_module('activation', Mish())     
+                if mdef['activation'] == 'linear':
+                    modules.add_module('result_shift', q_new.IntuitusReslult_shift())   
             else:
                 modules.add_module('Conv2d', nn.Conv2d(in_channels=output_filters[-1],
                                                        out_channels=filters,
@@ -491,6 +580,7 @@ def create_modules(module_defs, img_size, cfg, quantized, quantizer_output,reord
                 modules = FeatureConcat(layers=layers, groups=True)
             else:
                 modules = FeatureConcat(layers=layers, groups=False)
+                
 
         elif mdef['type'] == 'shortcut':  # nn.Sequential() placeholder for 'shortcut' layer
             layers = mdef['from']
@@ -798,6 +888,50 @@ class Darknet(nn.Module):
                         b.set_quantized_weights()
                         break    
                     print("Warning: module does not include an IntiutusConv2d Layer. Fuse layer norm could be faulty.")
+
+    def write_parameter_to_txt(self,path,print_scale_as_txt = True):
+        path = pathlib.Path(path).absolute()
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=False, onerror=None)        
+        path.mkdir(parents=True, exist_ok=True)
+        parameters = self.state_dict()
+        post_scale_dict = {}
+        f=open(str(path/'scales.txt'),'a')
+        layer_nbr = 0
+        f.write("{}: ".format(layer_nbr))
+        for key in parameters:
+            new_layer_nbr = [int(s) for s in key.split('.') if s.isdigit()][0]
+            if new_layer_nbr != layer_nbr:
+                f.write("\n{}: ".format(new_layer_nbr))
+                prev_layer_nbr = layer_nbr
+                layer_nbr = new_layer_nbr
+                
+            if print_scale_as_txt and 'scale' in key:
+                scale = parameters[key].cpu().data.numpy()
+                scale = np.int32(np.round(np.log2(scale+1e-5)))
+                if print_scale_as_txt and 'weight_quantizer.scale' in key:
+                    f.write("w_scale: ")
+                    post_scale_dict[str(layer_nbr)] += scale[0]
+                elif print_scale_as_txt and 'activation_quantizer.scale' in key:
+                    f.write("a_scale: ")    
+                    if layer_nbr == 0:
+                        scale[0] = -8
+                        post_scale_dict[str(layer_nbr)] = scale[0]
+                    else:
+                        post_scale_dict[str(layer_nbr)] = scale[0]
+                        post_scale_dict[str(prev_layer_nbr)] -= scale[0]
+                else:
+                    raise Exception("Key error:"+ key)
+                np.savetxt(f, scale,'%.1f',delimiter=',')
+                
+            np.save(str(path/key), parameters[key].cpu().data.numpy())
+        f.close()
+        f=open(str(path/'post_scales.txt'),'a')
+        print(post_scale_dict, file=f)
+        f.close()
+                
+                
+            
 
     def info(self, verbose=False):
         torch_utils.model_info(self, verbose)

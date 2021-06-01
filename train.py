@@ -26,6 +26,9 @@ spec.loader.exec_module(test_py)
 
 from datetime import datetime
 
+DEVICE = 'cpu'
+
+#torch.autograd.set_detect_anomaly(True)
 wdir = 'weights' + os.sep  # weights dir
 last = wdir + 'last.pt'
 best = wdir + 'best.pt'
@@ -38,7 +41,7 @@ hyp = {'giou': 1.0,  # giou loss gain
        'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
        'iou_t': 0.20,  # iou training threshold
-       'lr0': 5E-3,  # initial learning rate (SGD=5E-3, Adam=5E-4)
+       'lr0': 5E-5,  # initial learning rate (SGD=5E-3, Adam=5E-4)
        'lrf': 0.0005,  # final learning rate (with cos scheduler)
        'momentum': 0.937,  # SGD momentum
        'weight_decay': 0.0005,  # optimizer weight decay
@@ -53,12 +56,12 @@ hyp = {'giou': 1.0,  # giou loss gain
 
 def _create_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=64)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
-    parser.add_argument('--batch-size', type=int, default=1)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-fused.cfg', help='*.cfg path')
+    parser.add_argument('--epochs', type=int, default=22)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
+    parser.add_argument('--batch-size', type=int, default=4)  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    parser.add_argument('--cfg', type=str, default='./cfg/yolov3tiny/yolov3-tiny-quant.cfg', help='*.cfg path')
     parser.add_argument('--t_cfg', type=str, default=None)#'./cfg/yolov3tiny/yolov3-tiny-fused.cfg')#./cfg/yolov3tiny/yolov3-tiny-teacher.cfg')#'./cfg/yolov3tiny/yolov3-tiny-quant.cfg')#'./cfg/yolov4tiny/yolov3-tiny.cfg', help='teacher model cfg file path for knowledge distillation')
-    parser.add_argument('--weights', type=str, default='weights/retrain_full_relu.pt', help='initial weights path')
-    parser.add_argument('--t_weights', type=str, default='weights/last_v3_foldbn_all.pt', help='teacher model weights')    
+    parser.add_argument('--weights', type=str, default='weights/rt.pt', help='initial weights path')
+    parser.add_argument('--t_weights', type=str, default='weights/post_scale.pt', help='teacher model weights')    
     parser.add_argument('--data', type=str, default='data/coco2017_val_split.data', help='*.data path')
     parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
     parser.add_argument('--img-size', nargs='+', type=int, default=[416, 416], help='[min_train, max-train, test]')
@@ -67,7 +70,7 @@ def _create_parser():
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
-    parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
+    parser.add_argument('--buckcet', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
     parser.add_argument('--KDstr', type=int, default=5, help='Knowledge destillation strategy see https://github.com/SpursLipu/YOLOv3v4-ModelCompression-MultidatasetTraining-Multibackbone/#readme')
     parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
@@ -82,13 +85,13 @@ def _create_parser():
     parser.add_argument('--s', type=float, default=0.001, help='scale sparse rate')
     parser.add_argument('--prune', type=int, default=-1,
                         help='0:nomal prune or regular prune 1:shortcut prune 2:layer prune')
-    parser.add_argument('--quantized', type=int, default=5,
+    parser.add_argument('--quantized', type=int, default=6,
                         help='0:quantization way one Ternarized weight and 8bit activation')
     parser.add_argument('--a-bit', type=int, default=8,
                         help='a-bit')
-    parser.add_argument('--w-bit', type=int, default=8,
+    parser.add_argument('--w-bit', type=int, default=6,
                         help='w-bit')
-    parser.add_argument('--FPGA', action='store_true', help='FPGA')
+    parser.add_argument('--FPGA', type=bool, default=False)
     parser.add_argument('--test_img_outpath', type=str, default=None)#'./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
     parser.add_argument('--load_model', type=str, default=None) #"22-04-2021_10-25-04.pt", help='weights saved as model')
     parser.add_argument('--load_teacher_model', type=str, default=None) #"22-04-2021_00-13-22.pt", help='weights saved as model')
@@ -173,7 +176,6 @@ def train(hyp,opt):
         t_model =  torch.load(opt.load_teacher_model)
     elif t_cfg:
         t_model = Darknet(t_cfg).to(device)
-
     # print('<.....................using gridmask.......................>')
     # gridmask = GridMask(d1=96, d2=224, rotate=360, ratio=0.6, mode=1, prob=0.8)
 
@@ -259,10 +261,10 @@ def train(hyp,opt):
             load_darknet_weights(model, weights, pt=opt.pt, FPGA=opt.FPGA)
         model.to('cpu')
         model.fuse(quantized=opt.quantized, FPGA=opt.FPGA)
-        if opt.quantized == 5:
-            model.fuse_layer_norm()
+        #if opt.quantized == 5:
+            #model.fuse_layer_norm()
             #model.set_quantized_weights()
-        model.to('cuda:0')
+        model.to(DEVICE)
             
     if t_cfg:
         if t_weights.endswith('.pt'):
@@ -400,7 +402,7 @@ def train(hyp,opt):
     if opt.ema:
         ema = torch_utils.ModelEMA(model)
         
-    print(model)
+    #print(model)
     # Start training
     nb = len(dataloader)  # number of batches
     n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
@@ -417,7 +419,7 @@ def train(hyp,opt):
         scaler = amp.GradScaler(enabled=cuda)
         
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
-        model.to('cuda:0')
+        model.to(DEVICE)
         if opt.local_rank != -1:
             dataloader.sampler.set_epoch(epoch)  # DDP set seed
         # gridmask.set_prob(epoch, max_epoch)
@@ -440,8 +442,9 @@ def train(hyp,opt):
         #pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
         for i, (imgs, targets, paths, _) in enumerate(pbar):  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
-
+            imgs = imgs.to(device).float()
+            if opt.quantized != 5:
+                imgs = imgs/255.0
             # Burn-in
             if ni <= n_burn:
                 xi = [0, n_burn]  # x interp
@@ -593,7 +596,14 @@ def train(hyp,opt):
 
         final_epoch = epoch + 1 == epochs
         if not opt.notest or final_epoch:  # Calculate mAP
-            model.set_layer_norm()
+            
+            now = datetime.now()
+            #model.set_layer_norm()
+            #model.fuse_layer_norm()
+            dt_string = now.strftime("%d-%m-%Y_%H-%M-%S")
+            save_model_name =  'pt_models/'+dt_string+'.pt'
+            torch.save(model, save_model_name)       
+            
             is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
             results, maps = test_py.test(cfg,
                                       data,
@@ -661,10 +671,6 @@ def train(hyp,opt):
             if (best_fitness == fi) and not final_epoch:
                 torch.save(chkpt, best)
             del chkpt
-            now = datetime.now()
-            dt_string = now.strftime("%d-%m-%Y_%H-%M-%S")
-            save_model_name =  'pt_models/'+dt_string+'.pt'
-            torch.save(model, save_model_name)
             
 
         # end epoch ----------------------------------------------------------------------------------------------------

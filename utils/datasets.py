@@ -44,7 +44,7 @@ def exif_size(img):
 
 
 class LoadImages:  # for inference
-    def __init__(self, path, img_size=416, is_gray_scale=False):
+    def __init__(self, path, img_size=416):
         path = str(Path(path))  # os-agnostic
         files = []
         if os.path.isdir(path):
@@ -61,7 +61,6 @@ class LoadImages:  # for inference
         self.nF = nI + nV  # number of files
         self.video_flag = [False] * nI + [True] * nV
         self.mode = 'images'
-        self.is_gray_scale = is_gray_scale
         if any(videos):
             self.new_video(videos[0])  # new video
         else:
@@ -97,19 +96,15 @@ class LoadImages:  # for inference
         else:
             # Read image
             self.count += 1
-            if self.is_gray_scale:
-                img0 = cv2.imread(path, flags=cv2.IMREAD_GRAYSCALE)  # gray scale
-                img0 = np.expand_dims(img0, axis=-1)
-            else:
-                img0 = cv2.imread(path)  # BGR
+            img0 = cv2.imread(path)  # BGR
             assert img0 is not None, 'Image Not Found ' + path
             print('image %g/%g %s: ' % (self.count, self.nF, path), end='')
 
         # Padded resize
-        img = letterbox(img0, new_shape=self.img_size, is_gray_scale=self.is_gray_scale)[0]
+        img = letterbox(img0, new_shape=self.img_size)[0]
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1).copy()  # BGR to RGB, to 3x416x416
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
         # cv2.imwrite(path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
@@ -264,7 +259,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, rank=-1, is_gray_scale=False):
+                 cache_images=False, single_cls=False):
         path = str(Path(path))  # os-agnostic
         assert os.path.isfile(path), 'File not found %s. See %s' % (path, help_url)
         with open(path, 'r') as f:
@@ -284,7 +279,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
-        self.is_gray_scale = is_gray_scale
 
         # Define labels
         self.label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt')
@@ -423,12 +417,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         hyp = self.hyp
         if self.mosaic:
             # Load mosaic
-            img, labels = load_mosaic(self, index, self.is_gray_scale)
+            img, labels = load_mosaic(self, index)
             shapes = None
 
         else:
             # Load image
-            img, (h0, w0), (h, w) = load_image(self, index, self.is_gray_scale)
+            img, (h0, w0), (h, w) = load_image(self, index)
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
@@ -456,8 +450,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                                             shear=hyp['shear'])
 
             # Augment colorspace
-            if not self.is_gray_scale:
-                augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
             # Apply cutouts
             # if random.random() < 0.9:
@@ -492,11 +485,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
-        if not self.is_gray_scale:
-            img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
-        if self.is_gray_scale:
-            img = np.expand_dims(img, axis=0)
 
         return torch.from_numpy(img), labels_out, self.img_files[index], shapes
 
@@ -508,24 +498,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
 
-def load_image(self, index, is_gray_scale=False):
+def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
     img = self.imgs[index]
     if img is None:  # not cached
         path = self.img_files[index]
-        if is_gray_scale:
-            img = cv2.imread(path, flags=cv2.IMREAD_GRAYSCALE)  # gray scale
-            img = np.expand_dims(img, axis=-1)
-        else:
-            img = cv2.imread(path)  # BGR
+        img = cv2.imread(path)  # BGR
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r < 1 or (self.augment and r != 1):  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
             img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            if is_gray_scale:
-                img = np.expand_dims(img, axis=-1)
         return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
     else:
         return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
@@ -712,7 +696,7 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     #         img[:, :, i] = cv2.equalizeHist(img[:, :, i])
 
 
-def load_mosaic(self, index, is_gray_scale=False):
+def load_mosaic(self, index):
     # loads images in a mosaic
 
     labels4 = []
@@ -721,7 +705,7 @@ def load_mosaic(self, index, is_gray_scale=False):
     indices = [index] + [random.randint(0, len(self.labels) - 1) for _ in range(3)]  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
-        img, _, (h, w) = load_image(self, index, is_gray_scale)
+        img, _, (h, w) = load_image(self, index)
 
         # place img in img4
         if i == 0:  # top left
@@ -770,8 +754,7 @@ def load_mosaic(self, index, is_gray_scale=False):
     return img4, labels4
 
 
-def letterbox(img, new_shape=(416, 416), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True,
-              is_gray_scale=False):
+def letterbox(img, new_shape=(416, 416), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True):
     # Resize image to a 32-pixel-multiple rectangle https://github.com/ultralytics/yolov3/issues/232
     shape = img.shape[:2]  # current shape [height, width]
     if isinstance(new_shape, int):
@@ -798,13 +781,9 @@ def letterbox(img, new_shape=(416, 416), color=(114, 114, 114), auto=True, scale
 
     if shape[::-1] != new_unpad:  # resize
         img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-        if is_gray_scale:
-            img = np.expand_dims(img, axis=-1)
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
-    if is_gray_scale:
-        img = np.expand_dims(img, axis=-1)
     return img, ratio, (dw, dh)
 
 
@@ -924,7 +903,6 @@ def cutout(image, labels):
 
     return labels
 
-
 # class FenceMask(torch.nn.Module):
 #     def __init__(self, img_size, mean, probability=0.8):
 #         super(FenceMask, self).__init__()
@@ -1001,10 +979,10 @@ class FenceMask(torch.nn.Module):
         for j in range(self.group_size):
             masks = []
             for k in range(batch_size):
-                x = random.randint(self.img_size / 32, self.img_size / 16)
-                y = random.randint(self.img_size / 32, self.img_size / 16)
-                l1 = random.randint(self.img_size / 16, self.img_size / 8)
-                l2 = random.randint(self.img_size / 16, self.img_size / 8)
+                x = random.randint(self.img_size/32, self.img_size/16)
+                y = random.randint(self.img_size/32, self.img_size/16)
+                l1 = random.randint(self.img_size/16, self.img_size/8)
+                l2 = random.randint(self.img_size/16, self.img_size/8)
                 # mask_1代表横着的条纹，mask_2代表竖着的条纹
                 mask_1 = np.ones(shape=(self.img_size, self.img_size, 3))
                 mask_2 = np.ones(shape=(self.img_size, self.img_size, 3))
@@ -1033,8 +1011,8 @@ class FenceMask(torch.nn.Module):
                 masks.append(mask)
             masks = torch.cat(masks, dim=0).int()
             mask_white = (0.5 * torch.rand((batch_size, 3, img_size, img_size)) + 0.5) * masks
-            mask_black = (0.5 * torch.rand((batch_size, 3, img_size, img_size))) * (1 - masks)
-            masks = mask_black + mask_white
+            mask_black = (0.5 * torch.rand((batch_size, 3, img_size, img_size))) * (1-masks)
+            masks = mask_black+mask_white
             group_masks.append(masks.unsqueeze(0))
         group_masks = torch.cat(group_masks, dim=0)
         self.group_masks = torch.nn.Parameter(group_masks, requires_grad=True)
@@ -1060,11 +1038,10 @@ class FenceMask(torch.nn.Module):
         #     cv2.imshow('image', image)
         #     cv2.waitKey(500)
 
-        return x * masks, masks
+        return x*masks, masks
 
     def set_prob(self, epoch, max_epoch):
         self.prob = self.st_prob * min(1, epoch / max_epoch)
-
 
 class Grid(object):
     def __init__(self, d1, d2, rotate=1, ratio=0.5, mode=0, prob=1.):
