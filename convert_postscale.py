@@ -19,14 +19,16 @@ def _create_parser():
     parser.add_argument('--param_outpath', type=str, default='./parameters/int8_6')#'./detect_imgs', help='Path to output images. If set to None images are not saved.') #'./detect_imgs'
     parser.add_argument('--out_weights', type=str, default='weights/post_scale.pt', help='weights path')
     parser.add_argument('--w_bits', type=int, default=6, help='w-bit')
-    parser.add_argument('--b_bits', type=int, default=6, help='w-bit')
+    parser.add_argument('--b_bits', type=int, default=6, help='b-bit')
+    parser.add_argument('--a_bits', type=int, default=8, help='abit')
+    parser.add_argument('--accum_bits', type=int, default=16, help='accum-bit. MAC width')
     return parser.parse_args()    
 
-def export_parameter_npy(model,path,export_quantized=False,w_bits=6,b_bits=6):
+def export_parameter_npy(model,path,export_quantized=False,w_bits=6,b_bits=6,a_bits=8,accum_bits=16):
     b_min = -(1 << (b_bits - 1))
     b_max = (1 << (b_bits - 1)) - 1
     w_min = -(1 << (w_bits - 1))
-    w_max = (1 << (w_bits - 1)) - 1   
+    w_max = (1 << (w_bits - 1))   
     path = pathlib.Path(path).absolute()
     if path.exists():
         shutil.rmtree(path, ignore_errors=False, onerror=None)        
@@ -39,22 +41,25 @@ def export_parameter_npy(model,path,export_quantized=False,w_bits=6,b_bits=6):
         for key in parameters:                              
             layer_name = key.split('.')
             layer_name = '.'.join(layer_name[:3])
-            if ('.weight' in key) and not 'shift' in key:
+            if '.weight' in key and not 'shift' in key:
                 weight = parameters[key] << parameters[layer_name + '.weight_shift']
+                weight = torch.round(weight)
+                weight = torch.clamp(weight,w_min,w_max)
                 weight = weight.cpu().data.numpy()
-                weight = np.round(weight)
-                weight = np.clip(weight,w_min,w_max)
                 np.save(str(path/key),weight)
                 
-            if ('.bias' in key) and not 'shift' in key:
+            elif '.bias' in key and not 'shift' in key:
                 bias = parameters[key] << parameters[layer_name + '.bias_shift']
+                bias = bias << parameters[layer_name + '.weight_shift']
+                bias = bias >> parameters[layer_name + '.activation_shift']
+                bias = torch.round(bias)
+                bias = torch.clamp(bias,b_min,b_max)
                 bias = bias.cpu().data.numpy()
-                bias = np.round(bias)
-                bias = np.clip(bias,b_min,b_max)  
                 np.save(str(path/key),bias)
                 
-            if ('.activation_shift' in key):
-                np.save(str(path/key),parameters[key].data.numpy())
+            elif '.activation_shift' in key:
+                out_shift = accum_bits-a_bits-parameters[key].data.numpy()
+                np.save(str(path/key),out_shift)
 
 def convert(opt):
     img_size = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)

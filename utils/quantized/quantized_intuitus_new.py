@@ -522,27 +522,26 @@ class QuantizedConv2d_post_shift(nn.Conv2d):
         
         self.a_min_val = torch.tensor(-(1 << (self.a_bits - 1)), requires_grad=False)
         self.a_max_val = torch.tensor((1 << (self.a_bits - 1)) - 1, requires_grad=False)
-        self.w_min_val = torch.tensor(-(1 << (self.w_bits - 1)), requires_grad=False)
-        self.w_max_val = torch.tensor((1 << (self.w_bits - 1)) - 1, requires_grad=False)
+        self.b_min_val = torch.tensor(-(1 << (self.b_bits - 1)), requires_grad=False)
+        self.b_max_val = torch.tensor((1 << (self.b_bits - 1)) - 1, requires_grad=False)
+        self.w_min_val = torch.tensor(-(1 << (self.w_bits - 1)+1), requires_grad=False)
+        self.w_max_val = torch.tensor((1 << (self.w_bits - 1)-1), requires_grad=False)
         
     def round(self, input):
         output = Round.apply(input)
         return output
     
-    def forward(self, input):            
-        q_bias = self.bias
-        bias_shift = self.b_bits-self.bias.abs().max().log2().ceil()
-        q_bias = q_bias << bias_shift
-        q_bias = self.round(q_bias)  
-        q_bias = q_bias >> bias_shift            
-        
-        if input.shape[1] != 3:                
-            q_bias = q_bias << self.bias_shift    
-        else:
+    def forward(self, input):  
+        if input.shape[1] == 3:                
             input = input * 255.0
-            q_bias = q_bias * 256.0
             
-        q_bias = q_bias << self.weight_shift     
+        q_bias = self.bias
+        q_bias = q_bias << self.bias_shift
+        q_bias = q_bias << self.weight_shift
+        q_bias = q_bias >> self.activation_shift
+        q_bias = self.round(q_bias)
+        q_bias = torch.clamp(q_bias,self.b_min_val,self.b_max_val)  
+        q_bias = q_bias << self.activation_shift        
             
         q_weight = self.weight << self.weight_shift
         q_weight = self.round(q_weight)
@@ -606,23 +605,26 @@ class QuantizedConv2d_post_shift_fpga(nn.Conv2d):
         
         self.a_min_val = torch.tensor(-(1 << (self.a_bits - 1)), requires_grad=False)
         self.a_max_val = torch.tensor((1 << (self.a_bits - 1)) - 1, requires_grad=False)
+        self.b_min_val = torch.tensor(-(1 << (self.b_bits - 1)), requires_grad=False)
+        self.b_max_val = torch.tensor((1 << (self.b_bits - 1)) - 1, requires_grad=False)        
         self.w_min_val = torch.tensor(-(1 << (self.w_bits - 1)), requires_grad=False)
         self.w_max_val = torch.tensor((1 << (self.w_bits - 1)) - 1, requires_grad=False)
+
+    def round(self, input):
+        output = Round.apply(input)
+        return output
         
-    def forward(self, input):          
+    def forward(self, input):   
+        if input.shape[1] == 3:                
+            input = input * 255.0           
+        
         q_bias = self.bias
-        bias_shift = self.b_bits-self.bias.abs().max().log2().ceil()
-        q_bias = q_bias << bias_shift
-        q_bias = Round.apply(q_bias)  
-        q_bias = q_bias >> bias_shift         
-        
-        if input.shape[1] != 3:                
-            q_bias = q_bias << self.bias_shift    
-        else:
-            input = input * 255.0
-            q_bias = q_bias * 256.0
-            
-        q_bias = q_bias << self.weight_shift     
+        q_bias = q_bias << self.bias_shift
+        q_bias = q_bias << self.weight_shift
+        q_bias = q_bias >> self.activation_shift
+        q_bias = self.round(q_bias)
+        q_bias = torch.clamp(q_bias,self.b_min_val,self.b_max_val)  
+        q_bias = q_bias << self.activation_shift          
             
         q_weight = self.weight << self.weight_shift
         q_weight = Round.apply(q_weight)
@@ -654,7 +656,7 @@ class QuantizedConv2d_post_shift_fpga(nn.Conv2d):
             # if output.abs().max().log2().ceil() > (self.intrachannel_width-1.0):
             #     print('Overflow')
             output = output >> self.interchannel_shift
-            output = self.activation_quantizer.round(output)
+            output = self.round(output)
             output = torch.clamp(output,-1.0*2.0**(self.interchannel_width-1.0), 2.0**(self.interchannel_width-1.0)-1.0)
             output = output << self.interchannel_shift
                 
